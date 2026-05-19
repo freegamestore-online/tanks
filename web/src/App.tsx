@@ -75,12 +75,20 @@ interface Explosion {
   big: boolean;
 }
 
+interface ScorePopup {
+  x: number;
+  y: number;
+  points: number;
+  age: number;
+}
+
 interface GameState {
   field: Tile[][];
   player: Tank;
   enemies: Tank[];
   bullets: Bullet[];
   explosions: Explosion[];
+  popups: ScorePopup[];
   stage: number; // 1-indexed
   spawnQueue: EnemyKind[]; // enemies left to spawn this stage
   spawnTimer: number;
@@ -152,13 +160,47 @@ const LEVEL_3: string[] = [
   ".....BEB.....",
 ];
 
-const LEVELS: string[][] = [LEVEL_1, LEVEL_2, LEVEL_3];
+const LEVEL_4: string[] = [
+  ".............",
+  "..BB.....BB..",
+  "..BB.....BB..",
+  "......S......",
+  "BB.S.....S.BB",
+  ".............",
+  ".X..S.S.S..X.",
+  ".............",
+  "BB.S.....S.BB",
+  "......S......",
+  ".............",
+  ".....BBB.....",
+  ".....BEB.....",
+];
+
+const LEVEL_5: string[] = [
+  ".............",
+  "..BB.....BB..",
+  ".SSSS...SSSS.",
+  ".............",
+  "..XX.....XX..",
+  "..B.S...S.B..",
+  ".............",
+  "..B.S...S.B..",
+  "..XX.....XX..",
+  ".SSS.....SSS.",
+  ".............",
+  ".....BBB.....",
+  ".....BEB.....",
+];
+
+const LEVELS: string[][] = [LEVEL_1, LEVEL_2, LEVEL_3, LEVEL_4, LEVEL_5];
 
 // Enemy compositions per stage (left → right = first spawn → last)
 const STAGE_ENEMIES: EnemyKind[][] = [
   ["basic", "basic", "basic", "basic", "basic", "basic", "basic", "basic"],
   ["basic", "basic", "fast", "basic", "fast", "basic", "fast", "fast", "basic", "fast"],
   ["fast", "basic", "armor", "fast", "armor", "fast", "armor", "fast", "armor", "armor", "fast", "armor"],
+  ["basic", "fast", "fast", "armor", "fast", "armor", "fast", "armor", "fast", "armor", "armor", "armor", "fast", "armor"],
+  ["armor", "fast", "armor", "fast", "armor", "fast", "armor", "armor", "fast", "armor", "armor", "armor", "fast", "armor", "armor", "armor"],
 ];
 
 function parseField(stage: number): Tile[][] {
@@ -249,6 +291,7 @@ function freshStateForStage(stage: number, carryLives: number, carryScore: numbe
     enemies: [],
     bullets: [],
     explosions: [],
+    popups: [],
     stage,
     spawnQueue: queue.slice(),
     spawnTimer: 600,
@@ -629,6 +672,21 @@ export default function App() {
             break;
           }
           const bbox = { x: b.x, y: b.y, w: 4, h: 4 };
+          // Bullet-vs-bullet cancel (player bullet meets enemy bullet)
+          let canceled = false;
+          for (const other of s.bullets) {
+            if (other === b || !other.alive) continue;
+            if (other.ownerEnemy === b.ownerEnemy) continue;
+            const obox = { x: other.x, y: other.y, w: 4, h: 4 };
+            if (intersects(bbox, obox)) {
+              other.alive = false;
+              s.explosions.push({ x: (b.x + other.x) / 2 + 2, y: (b.y + other.y) / 2 + 2, age: 0, big: false });
+              canceled = true;
+              break;
+            }
+          }
+          if (canceled) { hit = "tank"; break; }
+
           if (!b.ownerEnemy) {
             for (const e of s.enemies) {
               if (!e.alive) continue;
@@ -639,8 +697,10 @@ export default function App() {
                   s.killsThisStage++;
                   const kind = e.kind as EnemyKind;
                   s.killsByKind[kind]++;
-                  s.totalScore += ENEMY_POINTS[kind];
+                  const pts = ENEMY_POINTS[kind];
+                  s.totalScore += pts;
                   s.explosions.push({ x: e.x + TANK_SIZE / 2, y: e.y + TANK_SIZE / 2, age: 0, big: true });
+                  s.popups.push({ x: e.x + TANK_SIZE / 2, y: e.y + TANK_SIZE / 2, points: pts, age: 0 });
                   sounds.playError();
                 } else {
                   s.explosions.push({ x: e.x + TANK_SIZE / 2, y: e.y + TANK_SIZE / 2, age: 0, big: false });
@@ -668,6 +728,17 @@ export default function App() {
       }
       s.explosions = liveExplosions;
 
+      // Age score popups (rise + fade over 800 ms)
+      const livePopups: ScorePopup[] = [];
+      for (const p of s.popups) {
+        p.age += dt;
+        if (p.age < 800) livePopups.push(p);
+      }
+      s.popups = livePopups;
+
+      // Cull dead bullets too (canceled bullets get marked alive=false above)
+      s.bullets = s.bullets.filter((b) => b.alive);
+
       s.enemies = s.enemies.filter((e) => e.alive);
 
       // Player respawn / lives / win / lose
@@ -675,6 +746,20 @@ export default function App() {
         if (s.lives > 1) {
           s.lives--;
           s.player = freshPlayer();
+          // Ram-kill: any enemy overlapping the respawn point dies (worth points)
+          for (const e of s.enemies) {
+            if (!e.alive) continue;
+            if (intersects(tankAabb(s.player), tankAabb(e))) {
+              e.alive = false;
+              s.killsThisStage++;
+              const kind = e.kind as EnemyKind;
+              s.killsByKind[kind]++;
+              const pts = ENEMY_POINTS[kind];
+              s.totalScore += pts;
+              s.explosions.push({ x: e.x + TANK_SIZE / 2, y: e.y + TANK_SIZE / 2, age: 0, big: true });
+              s.popups.push({ x: e.x + TANK_SIZE / 2, y: e.y + TANK_SIZE / 2, points: pts, age: 0 });
+            }
+          }
         } else {
           s.lives = 0;
           s.gameOver = true;
@@ -709,7 +794,9 @@ export default function App() {
         setScore(s.totalScore);
       }
 
-      // Phase transitions
+      // Phase transitions — flip phaseRef synchronously to prevent the next
+      // animation frame (before React rerenders) from re-entering and firing
+      // the sound / setState a dozen times.
       if (s.stageCleared && phaseRef.current === "playing") {
         const summary: StageSummary = {
           stage: s.stage,
@@ -720,12 +807,14 @@ export default function App() {
         };
         setStageClearSummary(summary);
         setPhase("stage-clear");
+        phaseRef.current = "stage-clear";
         sounds.playLevelUp();
       }
       if (s.gameOver && phaseRef.current === "playing") {
         updateHighScore(s.totalScore);
         updateBestStage(s.stage);
         setPhase("over");
+        phaseRef.current = "over";
         sounds.playGameOver();
       }
     },
@@ -789,6 +878,9 @@ export default function App() {
 
     // Explosions
     for (const ex of s.explosions) drawExplosion(ctx, ex);
+
+    // Score popups (above everything)
+    for (const p of s.popups) drawScorePopup(ctx, p);
   }, []);
 
   // Touch input
@@ -925,19 +1017,48 @@ export default function App() {
             minHeight: 0,
           }}
         >
-          <canvas
-            ref={canvasRef}
+          {/* Canvas + CRT scanline overlay sit inside a wrapper so the
+              scanlines align to the visible canvas. */}
+          <div
             style={{
-              imageRendering: "pixelated",
-              background: "#000",
-              border: "2px solid #1f2937",
-              borderRadius: "0.25rem",
+              position: "relative",
               maxWidth: "100%",
               maxHeight: "100%",
-              touchAction: "none",
-              boxShadow: "0 0 0 1px #facc15 inset, 0 4px 24px rgba(0,0,0,0.4)",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              padding: "6px",
+              background: "linear-gradient(180deg, #422006 0%, #2c1404 100%)",
+              border: "3px solid #facc15",
+              borderRadius: "0.4rem",
+              boxShadow: "0 0 0 1px #000 inset, 0 4px 24px rgba(0,0,0,0.5)",
             }}
-          />
+          >
+            <canvas
+              ref={canvasRef}
+              style={{
+                imageRendering: "pixelated",
+                background: "#000",
+                display: "block",
+                maxWidth: "100%",
+                maxHeight: "100%",
+                touchAction: "none",
+              }}
+            />
+            {/* Subtle CRT scanlines */}
+            <div
+              aria-hidden="true"
+              style={{
+                position: "absolute",
+                inset: 6,
+                pointerEvents: "none",
+                background:
+                  "repeating-linear-gradient(to bottom, rgba(0,0,0,0.10) 0 1px, transparent 1px 3px)",
+                mixBlendMode: "multiply",
+                borderRadius: "0.15rem",
+              }}
+            />
+          </div>
           {phase === "intro" && (
             <Overlay>
               <div style={{ fontFamily: "Fraunces, serif", fontWeight: 800, fontSize: "1.5rem", color: "#facc15" }}>
@@ -1285,6 +1406,22 @@ function drawTank(ctx: CanvasRenderingContext2D, t: Tank, frame: number) {
   // Hatch dot
   ctx.fillStyle = "rgba(0,0,0,0.4)";
   ctx.fillRect(cx - 1, cy - 1, 2, 2);
+}
+
+function drawScorePopup(ctx: CanvasRenderingContext2D, p: ScorePopup) {
+  const t = p.age / 800;
+  const yOffset = -16 * t;
+  const alpha = Math.max(0, 1 - t);
+  const text = `+${p.points}`;
+  ctx.font = "bold 11px 'Fraunces', serif";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  // Shadow first
+  ctx.fillStyle = `rgba(0, 0, 0, ${alpha * 0.7})`;
+  ctx.fillText(text, p.x + 1, p.y + yOffset + 1);
+  // Foreground on top
+  ctx.fillStyle = `rgba(254, 243, 199, ${alpha})`;
+  ctx.fillText(text, p.x, p.y + yOffset);
 }
 
 function drawExplosion(ctx: CanvasRenderingContext2D, e: Explosion) {
