@@ -256,22 +256,44 @@ function fire(t: Tank, s: GameState): boolean {
   return true;
 }
 
-function damageWall(s: GameState, px: number, py: number): "brick" | "steel" | "base" | null {
-  const c = Math.floor(px / TILE_PX);
-  const r = Math.floor(py / TILE_PX);
-  if (r < 0 || r >= ROWS || c < 0 || c >= COLS) return null;
-  const t = s.field[r]![c]!;
-  if (t === T_BRICK) {
-    s.field[r]![c] = T_EMPTY;
-    return "brick";
+// Check the bullet's full 4×4 box against the tile grid. A 4-px bullet
+// straddling the seam between two tiles must hit BOTH — sampling a single
+// point misses the tile whose half the seam isn't on. Returns the strongest
+// outcome found; if any brick is touched, smashes every brick the box overlaps
+// (NES Battle City rewards perpendicular shots by destroying two bricks).
+function damageBullet(s: GameState, b: Bullet): "brick" | "steel" | "base" | null {
+  const pts: ReadonlyArray<readonly [number, number]> = [
+    [b.x, b.y],
+    [b.x + 3, b.y],
+    [b.x, b.y + 3],
+    [b.x + 3, b.y + 3],
+  ];
+  let result: "brick" | "steel" | "base" | null = null;
+  const bricks: Array<[number, number]> = [];
+  const seen = new Set<string>();
+  for (const [px, py] of pts) {
+    const c = Math.floor(px / TILE_PX);
+    const r = Math.floor(py / TILE_PX);
+    if (r < 0 || r >= ROWS || c < 0 || c >= COLS) continue;
+    const key = `${r},${c}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const t = s.field[r]![c]!;
+    if (t === T_BRICK) {
+      bricks.push([r, c]);
+      if (!result) result = "brick";
+    } else if (t === T_STEEL) {
+      if (result !== "base") result = "steel";
+    } else if (t === T_EAGLE) {
+      s.baseAlive = false;
+      s.gameOver = true;
+      result = "base";
+    }
   }
-  if (t === T_STEEL) return "steel";
-  if (t === T_EAGLE) {
-    s.baseAlive = false;
-    s.gameOver = true;
-    return "base";
+  if (bricks.length > 0) {
+    for (const [r, c] of bricks) s.field[r]![c] = T_EMPTY;
   }
-  return null;
+  return result;
 }
 
 export default function App() {
@@ -481,10 +503,12 @@ export default function App() {
           const cx = b.x + 2;
           const cy = b.y + 2;
           if (cx < 0 || cx > FIELD_W || cy < 0 || cy > FIELD_H) { hit = "edge"; break; }
-          const wall = damageWall(s, cx, cy);
+          const wall = damageBullet(s, b);
           if (wall) {
             if (wall === "brick") {
               sounds.playMove();
+              s.explosions.push({ x: cx, y: cy, age: 0, big: false });
+            } else if (wall === "steel") {
               s.explosions.push({ x: cx, y: cy, age: 0, big: false });
             } else if (wall === "base") {
               sounds.playGameOver();
