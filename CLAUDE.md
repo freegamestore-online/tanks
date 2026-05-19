@@ -1,4 +1,4 @@
-# tanks
+# Tanks
 
 A free game on FreeGameStore.
 
