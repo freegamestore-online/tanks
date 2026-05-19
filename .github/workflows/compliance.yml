@@ -69,7 +69,7 @@ jobs:
           grep -qi "apple-mobile-web-app-capable\|mobile-web-app-capable" web/index.html
 
       - name: FreeAppStore link
-        run: grep -r "freeappstore.online" web/src/ | grep -q .
+        run: grep -r "freegamestore.online" web/src/ | grep -q .
 
       - name: Dark mode
         run: grep -rE "prefers-color-scheme|data-theme|color-scheme" web/src/ | grep -q .
