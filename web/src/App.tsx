@@ -8,7 +8,7 @@ import {
 } from "@freegamestore/games";
 import { useHighScore } from "./hooks/useHighScore";
 
-// Battle-City-style 13×13 field. Two-tile tanks, NES feel.
+// Battle-City-style 13×13 field. NES feel.
 
 const COLS = 13;
 const ROWS = 13;
@@ -17,11 +17,11 @@ const FIELD_W = COLS * TILE_PX;
 const FIELD_H = ROWS * TILE_PX;
 
 const TANK_SIZE = 2 * TILE_PX;
-const TANK_SPEED = 0.12; // px per ms
+const PLAYER_SPEED = 0.12; // px per ms
 const BULLET_SPEED = 0.36;
 const FIRE_COOLDOWN = 380;
 
-const ENEMY_GOAL = 8;
+const STAGE_BONUS = 500;
 const START_LIVES = 3;
 const MAX_LIVE_ENEMIES = 3;
 
@@ -41,15 +41,22 @@ const DIR_VEC: Record<Dir, { dx: number; dy: number }> = {
   right: { dx: 1, dy: 0 },
 };
 
+type EnemyKind = "basic" | "fast" | "armor";
+const ENEMY_SPEED: Record<EnemyKind, number> = { basic: 0.075, fast: 0.13, armor: 0.06 };
+const ENEMY_POINTS: Record<EnemyKind, number> = { basic: 100, fast: 200, armor: 400 };
+const ENEMY_HP: Record<EnemyKind, number> = { basic: 1, fast: 1, armor: 3 };
+
 interface Tank {
   x: number;
   y: number;
   dir: Dir;
   isEnemy: boolean;
+  kind: EnemyKind | "player";
+  hp: number;
   alive: boolean;
   cooldown: number;
   aiTimer: number;
-  spawnFlash: number; // ms remaining of "just spawned" flash
+  spawnFlash: number;
 }
 
 interface Bullet {
@@ -64,7 +71,7 @@ interface Bullet {
 interface Explosion {
   x: number;
   y: number;
-  age: number; // ms since start
+  age: number;
   big: boolean;
 }
 
@@ -74,40 +81,92 @@ interface GameState {
   enemies: Tank[];
   bullets: Bullet[];
   explosions: Explosion[];
+  stage: number; // 1-indexed
+  spawnQueue: EnemyKind[]; // enemies left to spawn this stage
   spawnTimer: number;
-  spawnQueue: number;
-  destroyed: number;
+  killsByKind: Record<EnemyKind, number>;
+  killsThisStage: number;
+  totalScore: number; // carries across stages
   lives: number;
   baseAlive: boolean;
+  stageCleared: boolean;
   gameOver: boolean;
-  victory: boolean;
   frame: number;
   time: number;
 }
 
-// 13×13 layout. Player spawns at (col 3, row 10), occupying cols 3-4, rows 10-11.
-// Eagle at row 12 col 6, protected by bricks at (11, 5-7), (12, 5), (12, 7).
-const LAYOUT: string[] = [
-  ".............", //  0
-  "..BB.....BB..", //  1
-  "..BB.....BB..", //  2
-  ".............", //  3
-  "BBBB.....BBBB", //  4
-  ".....SSS.....", //  5
-  "X..X.....X..X", //  6  (bushes for cover)
-  ".....SSS.....", //  7
-  "BBBB.....BBBB", //  8
-  ".............", //  9
-  ".............", // 10  ← player spawn area (cols 3-4)
-  ".....BBB.....", // 11
-  ".....BEB.....", // 12
+// ──────────── LEVELS ────────────
+// Each level is a 13-row × 13-col layout. Player spawns at (col 3, row 10),
+// occupying cols 3-4 / rows 10-11. Enemies spawn at three top-of-field 2×2
+// patches: (cols 0-1, rows 0-1), (cols 5-6, rows 0-1), (cols 11-12, rows 0-1).
+// All four 2×2 spawn patches MUST be empty in every layout.
+// Eagle (E) is at (row 12, col 6); protective bricks at (11, 5-7), (12, 5+7).
+//
+// B = brick (destructible) · S = steel · W = water · X = bush (cover)
+
+const LEVEL_1: string[] = [
+  ".............",
+  "..BB.....BB..",
+  "..BB.....BB..",
+  ".............",
+  "BBBB.....BBBB",
+  ".....SSS.....",
+  "X..X.....X..X",
+  ".....SSS.....",
+  "BBBB.....BBBB",
+  ".............",
+  ".............",
+  ".....BBB.....",
+  ".....BEB.....",
 ];
 
-function parseField(): Tile[][] {
+const LEVEL_2: string[] = [
+  ".............",
+  "..BB.....BB..",
+  "..BB.....BB..",
+  "B...........B",
+  "B.B.B.B.B.B.B",
+  ".............",
+  ".B...X.X...B.",
+  ".S.S.S.S.S.S.",
+  ".............",
+  "B.B.B.B.B.B.B",
+  ".............",
+  ".....BBB.....",
+  ".....BEB.....",
+];
+
+const LEVEL_3: string[] = [
+  ".............",
+  "..BB.....BB..",
+  "..BB.....BB..",
+  ".............",
+  ".SSSS...SSSS.",
+  ".S.........S.",
+  ".S..XXXXX..S.",
+  ".S.........S.",
+  ".SSSS...SSSS.",
+  ".............",
+  ".............",
+  ".....BBB.....",
+  ".....BEB.....",
+];
+
+const LEVELS: string[][] = [LEVEL_1, LEVEL_2, LEVEL_3];
+
+// Enemy compositions per stage (left → right = first spawn → last)
+const STAGE_ENEMIES: EnemyKind[][] = [
+  ["basic", "basic", "basic", "basic", "basic", "basic", "basic", "basic"],
+  ["basic", "basic", "fast", "basic", "fast", "basic", "fast", "fast", "basic", "fast"],
+  ["fast", "basic", "armor", "fast", "armor", "fast", "armor", "fast", "armor", "armor", "fast", "armor"],
+];
+
+function parseField(stage: number): Tile[][] {
+  const layout = LEVELS[Math.min(stage - 1, LEVELS.length - 1)] ?? LEVEL_1;
   const f: Tile[][] = [];
   for (let r = 0; r < ROWS; r++) {
     const row: Tile[] = [];
-    const line = LAYOUT[r] ?? "";
+    const line = layout[r] ?? "";
     for (let c = 0; c < COLS; c++) {
       const ch = line[c] ?? ".";
       row.push(
@@ -124,7 +183,7 @@ function parseField(): Tile[][] {
   return f;
 }
 
-function tankAabb(t: Tank): { x: number; y: number; w: number; h: number } {
+function tankAabb(t: Tank) {
   return { x: t.x, y: t.y, w: TANK_SIZE, h: TANK_SIZE };
 }
 
@@ -173,6 +232,8 @@ function freshPlayer(): Tank {
     y: PLAYER_SPAWN.y,
     dir: "up",
     isEnemy: false,
+    kind: "player",
+    hp: 1,
     alive: true,
     cooldown: 0,
     aiTimer: 0,
@@ -180,31 +241,38 @@ function freshPlayer(): Tank {
   };
 }
 
-function freshState(): GameState {
+function freshStateForStage(stage: number, carryLives: number, carryScore: number): GameState {
+  const queue = STAGE_ENEMIES[Math.min(stage - 1, STAGE_ENEMIES.length - 1)] ?? STAGE_ENEMIES[0]!;
   return {
-    field: parseField(),
+    field: parseField(stage),
     player: freshPlayer(),
     enemies: [],
     bullets: [],
     explosions: [],
-    spawnTimer: 500,
-    spawnQueue: ENEMY_GOAL,
-    destroyed: 0,
-    lives: START_LIVES,
+    stage,
+    spawnQueue: queue.slice(),
+    spawnTimer: 600,
+    killsByKind: { basic: 0, fast: 0, armor: 0 },
+    killsThisStage: 0,
+    totalScore: carryScore,
+    lives: carryLives,
     baseAlive: true,
+    stageCleared: false,
     gameOver: false,
-    victory: false,
     frame: 0,
     time: 0,
   };
 }
 
 function spawnEnemy(s: GameState): boolean {
+  const kind = s.spawnQueue[0];
+  if (!kind) return false;
   const spots = [
     { x: 0, y: 0 },
     { x: (COLS / 2 - 1) * TILE_PX, y: 0 },
     { x: (COLS - 2) * TILE_PX, y: 0 },
   ];
+  // Pick a spot that isn't overlapping
   for (const spot of spots) {
     if (!canTankOccupy(s.field, spot.x, spot.y)) continue;
     const tryBox = { x: spot.x, y: spot.y, w: TANK_SIZE, h: TANK_SIZE };
@@ -217,25 +285,38 @@ function spawnEnemy(s: GameState): boolean {
       y: spot.y,
       dir: "down",
       isEnemy: true,
+      kind,
+      hp: ENEMY_HP[kind],
       alive: true,
       cooldown: 700,
       aiTimer: 200 + Math.random() * 600,
       spawnFlash: 500,
     });
+    s.spawnQueue.shift();
     return true;
   }
   return false;
 }
 
-function tryMove(field: Tile[][], t: Tank, dx: number, dy: number): boolean {
+function tryMove(
+  field: Tile[][],
+  t: Tank,
+  dx: number,
+  dy: number,
+  others: ReadonlyArray<Tank>,
+): boolean {
   const nx = t.x + dx;
   const ny = t.y + dy;
-  if (canTankOccupy(field, nx, ny)) {
-    t.x = nx;
-    t.y = ny;
-    return true;
+  if (!canTankOccupy(field, nx, ny)) return false;
+  // Tank-vs-tank blocking — no ghosting through other live tanks.
+  const newBox = { x: nx, y: ny, w: TANK_SIZE, h: TANK_SIZE };
+  for (const o of others) {
+    if (o === t || !o.alive) continue;
+    if (intersects(newBox, tankAabb(o))) return false;
   }
-  return false;
+  t.x = nx;
+  t.y = ny;
+  return true;
 }
 
 function fire(t: Tank, s: GameState): boolean {
@@ -256,11 +337,8 @@ function fire(t: Tank, s: GameState): boolean {
   return true;
 }
 
-// Check the bullet's full 4×4 box against the tile grid. A 4-px bullet
-// straddling the seam between two tiles must hit BOTH — sampling a single
-// point misses the tile whose half the seam isn't on. Returns the strongest
-// outcome found; if any brick is touched, smashes every brick the box overlaps
-// (NES Battle City rewards perpendicular shots by destroying two bricks).
+// Check the bullet's full 4×4 box vs the tile grid. Smash every brick the
+// box overlaps in one shot (perpendicular shots take out two bricks).
 function damageBullet(s: GameState, b: Bullet): "brick" | "steel" | "base" | null {
   const pts: ReadonlyArray<readonly [number, number]> = [
     [b.x, b.y],
@@ -290,41 +368,71 @@ function damageBullet(s: GameState, b: Bullet): "brick" | "steel" | "base" | nul
       result = "base";
     }
   }
-  if (bricks.length > 0) {
-    for (const [r, c] of bricks) s.field[r]![c] = T_EMPTY;
-  }
+  if (bricks.length > 0) for (const [r, c] of bricks) s.field[r]![c] = T_EMPTY;
   return result;
 }
 
+// ──────────── React component ────────────
+
 export default function App() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const stateRef = useRef<GameState>(freshState());
+  const stateRef = useRef<GameState>(freshStateForStage(1, START_LIVES, 0));
   const inputRef = useRef<{ up: boolean; down: boolean; left: boolean; right: boolean; fire: boolean }>(
     { up: false, down: false, left: false, right: false, fire: false },
   );
   const lastTimeRef = useRef(0);
-  const destroyedRef = useRef(0);
+  const killsRef = useRef(0);
   const livesRef = useRef(START_LIVES);
+  const scoreRef = useRef(0);
+  const stageRef = useRef(1);
+  const phaseRef = useRef<Phase>("intro");
 
+  const [stage, setStage] = useState(1);
   const [score, setScore] = useState(0);
   const [lives, setLives] = useState(START_LIVES);
-  const [destroyed, setDestroyed] = useState(0);
-  const [phase, setPhase] = useState<"intro" | "playing" | "over" | "won">("intro");
+  const [kills, setKills] = useState(0);
+  const [phase, setPhase] = useState<Phase>("intro");
+  const [stageClearSummary, setStageClearSummary] = useState<StageSummary | null>(null);
   const [, force] = useState(0);
   const [bestScore, updateHighScore] = useHighScore("tanks-best");
+  const [bestStage, updateBestStage] = useHighScore("tanks-best-stage");
   const sounds = useGameSounds();
 
-  const start = useCallback(() => {
-    stateRef.current = freshState();
-    destroyedRef.current = 0;
+  phaseRef.current = phase;
+
+  const startNewGame = useCallback(() => {
+    stateRef.current = freshStateForStage(1, START_LIVES, 0);
+    killsRef.current = 0;
     livesRef.current = START_LIVES;
+    scoreRef.current = 0;
+    stageRef.current = 1;
     lastTimeRef.current = 0;
+    setStage(1);
     setScore(0);
     setLives(START_LIVES);
-    setDestroyed(0);
-    setPhase("playing");
+    setKills(0);
+    setStageClearSummary(null);
+    setPhase("stage-intro");
     force((x) => x + 1);
   }, []);
+
+  const advanceToNextStage = useCallback(() => {
+    const cur = stateRef.current;
+    const nextStage = cur.stage + 1;
+    if (nextStage > LEVELS.length) {
+      setPhase("won");
+      sounds.playLevelUp();
+      return;
+    }
+    stateRef.current = freshStateForStage(nextStage, cur.lives, cur.totalScore);
+    killsRef.current = 0;
+    stageRef.current = nextStage;
+    lastTimeRef.current = 0;
+    setStage(nextStage);
+    setKills(0);
+    setStageClearSummary(null);
+    setPhase("stage-intro");
+  }, [sounds]);
 
   // Keyboard
   useEffect(() => {
@@ -385,6 +493,13 @@ export default function App() {
     return () => ro.disconnect();
   }, []);
 
+  // Auto-advance "stage-intro" → "playing" after 1.8s
+  useEffect(() => {
+    if (phase !== "stage-intro") return;
+    const t = setTimeout(() => setPhase("playing"), 1800);
+    return () => clearTimeout(t);
+  }, [phase]);
+
   // Animation loop
   useEffect(() => {
     let raf = 0;
@@ -394,14 +509,14 @@ export default function App() {
       const s = stateRef.current;
       s.frame++;
       s.time += dt;
-      if (phase === "playing") step(s, dt);
+      if (phaseRef.current === "playing") step(s, dt);
       draw(s);
       raf = requestAnimationFrame(tick);
     };
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [phase]);
+  }, []);
 
   const step = useCallback(
     (s: GameState, dt: number) => {
@@ -416,7 +531,6 @@ export default function App() {
         else if (inp.left) newDir = "left";
         else if (inp.right) newDir = "right";
         if (newDir) {
-          // Snap to grid on perpendicular turn (NES Battle City feel)
           if (newDir !== s.player.dir) {
             if (newDir === "up" || newDir === "down") {
               s.player.x = Math.round(s.player.x / TILE_PX) * TILE_PX;
@@ -426,7 +540,7 @@ export default function App() {
           }
           s.player.dir = newDir;
           const v = DIR_VEC[newDir];
-          tryMove(s.field, s.player, v.dx * TANK_SPEED * dt, v.dy * TANK_SPEED * dt);
+          tryMove(s.field, s.player, v.dx * PLAYER_SPEED * dt, v.dy * PLAYER_SPEED * dt, s.enemies);
         }
         if (inp.fire && s.player.cooldown === 0) {
           if (fire(s.player, s)) sounds.playMove();
@@ -438,52 +552,50 @@ export default function App() {
         if (!e.alive) continue;
         e.spawnFlash = Math.max(0, e.spawnFlash - dt);
         e.cooldown = Math.max(0, e.cooldown - dt);
-        if (e.spawnFlash > 0) continue; // can't move during spawn flash
+        if (e.spawnFlash > 0) continue;
         e.aiTimer -= dt;
         if (e.aiTimer <= 0) {
           const choices: Dir[] = ["up", "down", "left", "right"];
           if (Math.random() < 0.65) {
-            // Bias toward player or base (whichever closer)
             const tx = Math.random() < 0.5 ? s.player.x : 5 * TILE_PX;
             const ty = Math.random() < 0.5 ? s.player.y : 12 * TILE_PX;
             const dx = tx - e.x;
             const dy = ty - e.y;
-            if (Math.abs(dx) > Math.abs(dy)) {
-              choices.unshift(dx > 0 ? "right" : "left");
-            } else {
-              choices.unshift(dy > 0 ? "down" : "up");
-            }
+            if (Math.abs(dx) > Math.abs(dy)) choices.unshift(dx > 0 ? "right" : "left");
+            else choices.unshift(dy > 0 ? "down" : "up");
           } else {
             for (let i = choices.length - 1; i > 0; i--) {
               const j = Math.floor(Math.random() * (i + 1));
               [choices[i], choices[j]] = [choices[j]!, choices[i]!];
             }
           }
-          // Snap to grid on turn
           const next = choices[0]!;
           if (next !== e.dir) {
-            if (next === "up" || next === "down") {
-              e.x = Math.round(e.x / TILE_PX) * TILE_PX;
-            } else {
-              e.y = Math.round(e.y / TILE_PX) * TILE_PX;
-            }
+            if (next === "up" || next === "down") e.x = Math.round(e.x / TILE_PX) * TILE_PX;
+            else e.y = Math.round(e.y / TILE_PX) * TILE_PX;
           }
           e.dir = next;
           e.aiTimer = 800 + Math.random() * 1400;
         }
         const v = DIR_VEC[e.dir];
-        const moved = tryMove(s.field, e, v.dx * TANK_SPEED * 0.8 * dt, v.dy * TANK_SPEED * 0.8 * dt);
+        const speed = e.kind === "player" ? PLAYER_SPEED : ENEMY_SPEED[e.kind as EnemyKind];
+        // Enemies are blocked by all other live tanks (other enemies + the player).
+        const blockers: Tank[] = [s.player, ...s.enemies];
+        const moved = tryMove(s.field, e, v.dx * speed * dt, v.dy * speed * dt, blockers);
         if (!moved && e.aiTimer > 250) e.aiTimer = 120;
         if (e.cooldown === 0 && Math.random() < 0.015) fire(e, s);
       }
 
       // Spawning
-      if (s.spawnQueue > 0) {
+      if (s.spawnQueue.length > 0) {
         s.spawnTimer -= dt;
         const alive = s.enemies.reduce((n, e) => n + (e.alive ? 1 : 0), 0);
         if (s.spawnTimer <= 0 && alive < MAX_LIVE_ENEMIES) {
-          if (spawnEnemy(s)) s.spawnQueue--;
-          s.spawnTimer = 1500;
+          if (spawnEnemy(s)) {
+            s.spawnTimer = 1500;
+          } else {
+            s.spawnTimer = 300;
+          }
         }
       }
 
@@ -492,7 +604,6 @@ export default function App() {
       for (const b of s.bullets) {
         if (!b.alive) continue;
         const v = DIR_VEC[b.dir];
-        // Sub-step bullets to prevent tunneling through walls
         const steps = 2;
         let hit: "wall" | "tank" | "edge" | null = null;
         for (let i = 0; i < steps && !hit; i++) {
@@ -522,11 +633,19 @@ export default function App() {
             for (const e of s.enemies) {
               if (!e.alive) continue;
               if (intersects(bbox, tankAabb(e))) {
-                e.alive = false;
-                s.destroyed++;
-                s.explosions.push({ x: e.x + TANK_SIZE / 2, y: e.y + TANK_SIZE / 2, age: 0, big: true });
+                e.hp -= 1;
+                if (e.hp <= 0) {
+                  e.alive = false;
+                  s.killsThisStage++;
+                  const kind = e.kind as EnemyKind;
+                  s.killsByKind[kind]++;
+                  s.totalScore += ENEMY_POINTS[kind];
+                  s.explosions.push({ x: e.x + TANK_SIZE / 2, y: e.y + TANK_SIZE / 2, age: 0, big: true });
+                  sounds.playError();
+                } else {
+                  s.explosions.push({ x: e.x + TANK_SIZE / 2, y: e.y + TANK_SIZE / 2, age: 0, big: false });
+                }
                 hit = "tank";
-                sounds.playError();
                 break;
               }
             }
@@ -541,7 +660,7 @@ export default function App() {
       }
       s.bullets = liveBullets;
 
-      // Explosions age
+      // Age explosions
       const liveExplosions: Explosion[] = [];
       for (const e of s.explosions) {
         e.age += dt;
@@ -549,11 +668,10 @@ export default function App() {
       }
       s.explosions = liveExplosions;
 
-      // Cull dead enemies
       s.enemies = s.enemies.filter((e) => e.alive);
 
       // Player respawn / lives / win / lose
-      if (!s.player.alive && !s.gameOver) {
+      if (!s.player.alive && !s.gameOver && !s.stageCleared) {
         if (s.lives > 1) {
           s.lives--;
           s.player = freshPlayer();
@@ -563,32 +681,55 @@ export default function App() {
         }
       }
       if (!s.baseAlive) s.gameOver = true;
-      if (s.destroyed >= ENEMY_GOAL && !s.gameOver) {
-        s.gameOver = true;
-        s.victory = true;
+
+      // Stage clear: all queued enemies spawned AND none alive AND player alive AND base intact
+      if (
+        !s.gameOver &&
+        !s.stageCleared &&
+        s.spawnQueue.length === 0 &&
+        s.enemies.length === 0 &&
+        s.player.alive &&
+        s.baseAlive
+      ) {
+        s.stageCleared = true;
+        s.totalScore += STAGE_BONUS;
       }
 
       // Sync React state minimally
-      if (s.destroyed !== destroyedRef.current) {
-        destroyedRef.current = s.destroyed;
-        setDestroyed(s.destroyed);
-        setScore(s.destroyed * 100);
+      if (s.killsThisStage !== killsRef.current) {
+        killsRef.current = s.killsThisStage;
+        setKills(s.killsThisStage);
       }
       if (s.lives !== livesRef.current) {
         livesRef.current = s.lives;
         setLives(s.lives);
       }
-      if (s.gameOver && phase === "playing") {
-        const won = s.victory && s.baseAlive;
-        setPhase(won ? "won" : "over");
-        const final = s.destroyed * 100 + (won ? 500 : 0);
-        setScore(final);
-        updateHighScore(final);
-        if (won) sounds.playLevelUp();
-        else sounds.playGameOver();
+      if (s.totalScore !== scoreRef.current) {
+        scoreRef.current = s.totalScore;
+        setScore(s.totalScore);
+      }
+
+      // Phase transitions
+      if (s.stageCleared && phaseRef.current === "playing") {
+        const summary: StageSummary = {
+          stage: s.stage,
+          killsByKind: { ...s.killsByKind },
+          totalKills: s.killsThisStage,
+          bonus: STAGE_BONUS,
+          score: s.totalScore,
+        };
+        setStageClearSummary(summary);
+        setPhase("stage-clear");
+        sounds.playLevelUp();
+      }
+      if (s.gameOver && phaseRef.current === "playing") {
+        updateHighScore(s.totalScore);
+        updateBestStage(s.stage);
+        setPhase("over");
+        sounds.playGameOver();
       }
     },
-    [phase, sounds, updateHighScore],
+    [sounds, updateHighScore, updateBestStage],
   );
 
   const draw = useCallback((s: GameState) => {
@@ -596,11 +737,10 @@ export default function App() {
     if (!canvas) return;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
-    // Background
-    ctx.fillStyle = "#0a0a0a";
+    ctx.fillStyle = "#000000";
     ctx.fillRect(0, 0, FIELD_W, FIELD_H);
 
-    // Subtle grid for arcade feel
+    // Subtle grid
     ctx.strokeStyle = "rgba(255,255,255,0.025)";
     ctx.lineWidth = 1;
     for (let i = 0; i <= COLS; i++) {
@@ -625,37 +765,33 @@ export default function App() {
       }
     }
 
-    // Bullet trails first
+    // Bullet trails
     for (const b of s.bullets) {
-      ctx.fillStyle = "rgba(254,243,199,0.4)";
+      ctx.fillStyle = "rgba(254,243,199,0.35)";
       for (const p of b.trail) ctx.fillRect(p.x - 1, p.y - 1, 3, 3);
     }
-
     // Bullets
     for (const b of s.bullets) {
-      ctx.fillStyle = "#fef3c7";
+      ctx.fillStyle = b.ownerEnemy ? "#fef3c7" : "#fef9c3";
       ctx.fillRect(b.x, b.y, 4, 4);
     }
 
     // Tanks
-    if (s.player.alive) drawTank(ctx, s.player, "#facc15", "#7c2d12", s.frame);
-    for (const e of s.enemies) {
-      if (!e.alive) continue;
-      drawTank(ctx, e, "#cbd5e1", "#1e293b", s.frame);
-    }
+    if (s.player.alive) drawTank(ctx, s.player, s.frame);
+    for (const e of s.enemies) if (e.alive) drawTank(ctx, e, s.frame);
 
-    // Bushes on top (cover)
+    // Bushes on top
     for (let r = 0; r < ROWS; r++) {
       for (let c = 0; c < COLS; c++) {
         if (s.field[r]![c] === T_BUSH) drawTile(ctx, c * TILE_PX, r * TILE_PX, T_BUSH, s.time);
       }
     }
 
-    // Explosions on top of everything
+    // Explosions
     for (const ex of s.explosions) drawExplosion(ctx, ex);
   }, []);
 
-  // Touch controls
+  // Touch input
   const setInput = (key: keyof typeof inputRef.current, v: boolean) => {
     inputRef.current[key] = v;
     if (key !== "fire" && v) {
@@ -690,33 +826,42 @@ export default function App() {
     </button>
   );
 
+  // Enemy queue strip — small tank icons representing remaining un-spawned enemies
+  const queue = stateRef.current.spawnQueue;
+
   return (
     <GameShell
       topbar={
         <GameTopbar
-          title="Tanks"
+          title={`Tanks · Stage ${stage}`}
           stats={[
             { label: "Score", value: score, accent: true },
             { label: "Lives", value: lives },
-            { label: "Kills", value: `${destroyed}/${ENEMY_GOAL}` },
+            { label: "Kills", value: kills },
             { label: "Best", value: bestScore },
+            { label: "Top St.", value: bestStage },
           ]}
           rules={
             <div>
               <h3 style={{ marginBottom: "0.5rem", fontWeight: 700 }}>Tanks</h3>
-              <p>Defend the eagle and destroy {ENEMY_GOAL} enemy tanks.</p>
+              <p>Defend the eagle and clear all enemy tanks. {LEVELS.length} stages of increasing difficulty.</p>
               <h4 style={{ marginTop: "0.75rem", fontWeight: 600 }}>Controls</h4>
               <ul style={{ paddingLeft: "1.2rem", marginTop: "0.25rem" }}>
                 <li>Desktop: arrows (or WASD) to move, Space / Enter / X / K to fire</li>
                 <li>Mobile: D-pad + Fire button below the field</li>
               </ul>
+              <h4 style={{ marginTop: "0.75rem", fontWeight: 600 }}>Enemy types</h4>
+              <ul style={{ paddingLeft: "1.2rem", marginTop: "0.25rem" }}>
+                <li><strong>Basic</strong> (silver) — 100 pts, 1 hit</li>
+                <li><strong>Fast</strong> (white) — 200 pts, 1 hit, but quick</li>
+                <li><strong>Armor</strong> (gold-trim) — 400 pts, takes 3 hits</li>
+              </ul>
               <h4 style={{ marginTop: "0.75rem", fontWeight: 600 }}>Rules</h4>
               <ul style={{ paddingLeft: "1.2rem", marginTop: "0.25rem" }}>
-                <li>3 lives. Lose all = game over.</li>
+                <li>3 lives across all stages. Lose all = game over.</li>
                 <li>If the eagle is hit you lose instantly — keep its brick ring intact.</li>
-                <li>Brick walls crumble. Steel walls don't.</li>
-                <li>Bushes hide tanks (cover for both sides).</li>
-                <li>Survive bonus +500 for clearing all enemies with the base intact.</li>
+                <li>Brick walls crumble. Steel walls don't. Bushes hide tanks.</li>
+                <li>Survive bonus +{STAGE_BONUS} per stage cleared with base intact.</li>
               </ul>
             </div>
           }
@@ -731,10 +876,44 @@ export default function App() {
           flexDirection: "column",
           alignItems: "center",
           padding: "0.5rem",
-          gap: "0.5rem",
+          gap: "0.4rem",
           overflow: "hidden",
         }}
       >
+        {/* Enemy queue strip */}
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: "0.5rem",
+            width: "100%",
+            maxWidth: `${FIELD_W * 2}px`,
+            padding: "0.25rem 0.5rem",
+          }}
+        >
+          <span
+            style={{
+              fontFamily: "Fraunces, serif",
+              fontWeight: 700,
+              fontSize: "0.75rem",
+              color: "var(--muted)",
+              letterSpacing: "0.1em",
+              textTransform: "uppercase",
+            }}
+          >
+            Queue
+          </span>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: "3px", flex: 1 }}>
+            {queue.length === 0 ? (
+              <span style={{ color: "var(--muted)", fontSize: "0.75rem" }}>—</span>
+            ) : (
+              queue.map((k, i) => (
+                <QueueIcon key={i} kind={k} />
+              ))
+            )}
+          </div>
+        </div>
+
         <div
           style={{
             position: "relative",
@@ -750,7 +929,7 @@ export default function App() {
             ref={canvasRef}
             style={{
               imageRendering: "pixelated",
-              background: "#0a0a0a",
+              background: "#000",
               border: "2px solid #1f2937",
               borderRadius: "0.25rem",
               maxWidth: "100%",
@@ -762,30 +941,72 @@ export default function App() {
           {phase === "intro" && (
             <Overlay>
               <div style={{ fontFamily: "Fraunces, serif", fontWeight: 800, fontSize: "1.5rem", color: "#facc15" }}>
-                Defend the eagle
+                TANKS
               </div>
-              <div style={{ color: "var(--paper)", fontSize: "0.85rem", textAlign: "center", maxWidth: "16rem" }}>
+              <div style={{ color: "var(--paper)", fontSize: "0.85rem", textAlign: "center", maxWidth: "18rem" }}>
+                Defend the eagle across {LEVELS.length} stages.<br />
                 Arrows / WASD to move · Space / X to fire
               </div>
-              <GameButton size="md" variant="primary" onClick={start}>Start</GameButton>
+              <GameButton size="md" variant="primary" onClick={startNewGame}>Start</GameButton>
+            </Overlay>
+          )}
+          {phase === "stage-intro" && (
+            <Overlay>
+              <div
+                style={{
+                  fontFamily: "Fraunces, serif",
+                  fontWeight: 800,
+                  fontSize: "2rem",
+                  color: "#facc15",
+                  letterSpacing: "0.15em",
+                }}
+              >
+                STAGE {stage}
+              </div>
+              <div style={{ color: "var(--paper)", fontSize: "0.85rem" }}>
+                {STAGE_ENEMIES[stage - 1]?.length ?? 0} enemy tanks · {lives} lives
+              </div>
+            </Overlay>
+          )}
+          {phase === "stage-clear" && stageClearSummary && (
+            <Overlay>
+              <div style={{ fontFamily: "Fraunces, serif", fontWeight: 800, fontSize: "1.5rem", color: "#10b981" }}>
+                STAGE {stageClearSummary.stage} CLEAR
+              </div>
+              <div style={{ color: "var(--paper)", fontSize: "0.85rem", display: "grid", gridTemplateColumns: "auto auto", gap: "0.2rem 1rem", textAlign: "left" }}>
+                <span>Basic ×{stageClearSummary.killsByKind.basic}</span>
+                <span>{stageClearSummary.killsByKind.basic * ENEMY_POINTS.basic} pts</span>
+                <span>Fast ×{stageClearSummary.killsByKind.fast}</span>
+                <span>{stageClearSummary.killsByKind.fast * ENEMY_POINTS.fast} pts</span>
+                <span>Armor ×{stageClearSummary.killsByKind.armor}</span>
+                <span>{stageClearSummary.killsByKind.armor * ENEMY_POINTS.armor} pts</span>
+                <span style={{ color: "#facc15" }}>Survive bonus</span>
+                <span style={{ color: "#facc15" }}>+{stageClearSummary.bonus}</span>
+                <span style={{ color: "#facc15", fontWeight: 700 }}>Total</span>
+                <span style={{ color: "#facc15", fontWeight: 700 }}>{stageClearSummary.score}</span>
+              </div>
+              <GameButton size="md" variant="primary" onClick={advanceToNextStage}>
+                {stage >= LEVELS.length ? "Finish" : "Next Stage"}
+              </GameButton>
             </Overlay>
           )}
           {phase === "over" && (
             <Overlay>
               <div style={{ fontFamily: "Fraunces, serif", fontWeight: 800, fontSize: "1.5rem", color: "#ef4444" }}>
-                Game Over
+                GAME OVER
               </div>
+              <div style={{ color: "#f8fafc" }}>Reached Stage {stage}</div>
               <div style={{ color: "#f8fafc" }}>Score: {score}</div>
-              <GameButton size="md" variant="primary" onClick={start}>Try Again</GameButton>
+              <GameButton size="md" variant="primary" onClick={startNewGame}>Try Again</GameButton>
             </Overlay>
           )}
           {phase === "won" && (
             <Overlay>
               <div style={{ fontFamily: "Fraunces, serif", fontWeight: 800, fontSize: "1.5rem", color: "#10b981" }}>
-                Victory!
+                ALL STAGES CLEAR
               </div>
-              <div style={{ color: "#f8fafc" }}>Score: {score}</div>
-              <GameButton size="md" variant="primary" onClick={start}>Play Again</GameButton>
+              <div style={{ color: "#f8fafc" }}>Final Score: {score}</div>
+              <GameButton size="md" variant="primary" onClick={startNewGame}>Play Again</GameButton>
             </Overlay>
           )}
         </div>
@@ -852,6 +1073,16 @@ export default function App() {
   );
 }
 
+type Phase = "intro" | "stage-intro" | "playing" | "stage-clear" | "over" | "won";
+
+interface StageSummary {
+  stage: number;
+  killsByKind: Record<EnemyKind, number>;
+  totalKills: number;
+  bonus: number;
+  score: number;
+}
+
 function Overlay({ children }: { children: React.ReactNode }) {
   return (
     <div
@@ -863,7 +1094,7 @@ function Overlay({ children }: { children: React.ReactNode }) {
         alignItems: "center",
         justifyContent: "center",
         gap: "0.75rem",
-        background: "rgba(10,10,10,0.82)",
+        background: "rgba(0,0,0,0.88)",
         borderRadius: "0.25rem",
       }}
     >
@@ -872,27 +1103,43 @@ function Overlay({ children }: { children: React.ReactNode }) {
   );
 }
 
+function QueueIcon({ kind }: { kind: EnemyKind }) {
+  const color =
+    kind === "armor" ? "#fbbf24" :
+    kind === "fast" ? "#e2e8f0" :
+    "#94a3b8";
+  return (
+    <span
+      title={kind}
+      style={{
+        display: "inline-block",
+        width: 12,
+        height: 12,
+        background: color,
+        border: "1px solid rgba(0,0,0,0.6)",
+        borderRadius: 2,
+        boxShadow: "inset 0 -2px 0 rgba(0,0,0,0.35), inset 0 2px 0 rgba(255,255,255,0.25)",
+      }}
+    />
+  );
+}
+
 function drawTile(ctx: CanvasRenderingContext2D, x: number, y: number, t: Tile, time: number) {
   if (t === T_BRICK) {
-    // Two rows of bricks per tile, staggered. Mortar lines visible.
     ctx.fillStyle = "#5b1d0e";
     ctx.fillRect(x, y, TILE_PX, TILE_PX);
     ctx.fillStyle = "#c0411b";
     const half = TILE_PX / 2;
     const w = TILE_PX / 2;
-    // Top row
     ctx.fillRect(x + 1, y + 1, w - 2, half - 2);
     ctx.fillRect(x + half + 1, y + 1, w - 2, half - 2);
-    // Bottom row (staggered by quarter)
     ctx.fillRect(x + 1, y + half + 1, w / 2 - 2, half - 2);
     ctx.fillRect(x + w / 2 + 1, y + half + 1, w - 2, half - 2);
     ctx.fillRect(x + half + w / 2 + 1, y + half + 1, w / 2 - 2, half - 2);
-    // Highlight
     ctx.fillStyle = "rgba(254,215,170,0.25)";
     ctx.fillRect(x + 2, y + 2, 4, 1);
     ctx.fillRect(x + half + 2, y + 2, 4, 1);
   } else if (t === T_STEEL) {
-    // Brushed-metal cross
     ctx.fillStyle = "#475569";
     ctx.fillRect(x, y, TILE_PX, TILE_PX);
     ctx.fillStyle = "#94a3b8";
@@ -904,7 +1151,6 @@ function drawTile(ctx: CanvasRenderingContext2D, x: number, y: number, t: Tile, 
     ctx.fillRect(x + TILE_PX / 2 - 1, y + 2, 2, TILE_PX - 4);
     ctx.fillRect(x + 2, y + TILE_PX / 2 - 1, TILE_PX - 4, 2);
   } else if (t === T_WATER) {
-    // Animated ripples
     ctx.fillStyle = "#1e3a8a";
     ctx.fillRect(x, y, TILE_PX, TILE_PX);
     const phase = Math.floor(time / 250) % 2;
@@ -937,26 +1183,19 @@ function drawTile(ctx: CanvasRenderingContext2D, x: number, y: number, t: Tile, 
     ctx.fillStyle = "#1f2937";
     ctx.fillRect(x, y, TILE_PX, TILE_PX);
     ctx.fillStyle = "#fef3c7";
-    // Eagle silhouette — chunky pixel art
-    // Head
     ctx.fillRect(x + 11, y + 4, 6, 4);
-    // Beak
     ctx.fillStyle = "#f59e0b";
     ctx.fillRect(x + 13, y + 8, 2, 3);
-    // Eyes
     ctx.fillStyle = "#0a0a0a";
     ctx.fillRect(x + 12, y + 5, 1, 2);
     ctx.fillRect(x + 15, y + 5, 1, 2);
-    // Body + wings
     ctx.fillStyle = "#fef3c7";
     ctx.fillRect(x + 9, y + 11, 10, 6);
     ctx.fillRect(x + 5, y + 13, 4, 8);
     ctx.fillRect(x + 19, y + 13, 4, 8);
     ctx.fillRect(x + 3, y + 16, 3, 6);
     ctx.fillRect(x + 22, y + 16, 3, 6);
-    // Tail
     ctx.fillRect(x + 10, y + 17, 8, 6);
-    // Wing details
     ctx.fillStyle = "#d97706";
     ctx.fillRect(x + 6, y + 14, 2, 1);
     ctx.fillRect(x + 20, y + 14, 2, 1);
@@ -964,17 +1203,11 @@ function drawTile(ctx: CanvasRenderingContext2D, x: number, y: number, t: Tile, 
   }
 }
 
-function drawTank(
-  ctx: CanvasRenderingContext2D,
-  t: Tank,
-  body: string,
-  dark: string,
-  frame: number,
-) {
+function drawTank(ctx: CanvasRenderingContext2D, t: Tank, frame: number) {
   const { x, y, dir } = t;
   const s = TANK_SIZE;
 
-  // Spawn flash — strobe before becoming solid
+  // Spawn flash
   if (t.spawnFlash > 0) {
     const on = Math.floor(t.spawnFlash / 80) % 2 === 0;
     ctx.fillStyle = on ? "rgba(250,204,21,0.55)" : "rgba(96,165,250,0.45)";
@@ -982,13 +1215,22 @@ function drawTank(
     return;
   }
 
+  // Colors by kind
+  const body = t.kind === "player" ? "#facc15"
+    : t.kind === "fast" ? "#e2e8f0"
+    : t.kind === "armor" ? "#fbbf24"
+    : "#94a3b8";
+  const dark = t.kind === "player" ? "#7c2d12"
+    : t.kind === "fast" ? "#475569"
+    : t.kind === "armor" ? "#7c2d12"
+    : "#1e293b";
+
   const treadFrame = Math.floor(frame / 4) % 2;
 
-  // Tread strips (left + right)
+  // Treads
   ctx.fillStyle = dark;
   ctx.fillRect(x + 2, y + 4, 8, s - 8);
   ctx.fillRect(x + s - 10, y + 4, 8, s - 8);
-  // Tread cleats
   ctx.fillStyle = "rgba(0,0,0,0.45)";
   for (let i = 0; i < 5; i++) {
     const cy = y + 6 + i * 9 + treadFrame * 2;
@@ -999,7 +1241,6 @@ function drawTank(
   // Hull
   ctx.fillStyle = body;
   ctx.fillRect(x + 10, y + 6, s - 20, s - 12);
-  // Hull shading
   ctx.fillStyle = "rgba(0,0,0,0.25)";
   ctx.fillRect(x + 10, y + s - 8, s - 20, 2);
   ctx.fillStyle = "rgba(255,255,255,0.18)";
@@ -1015,6 +1256,23 @@ function drawTank(
   ctx.fillStyle = "rgba(255,255,255,0.18)";
   ctx.fillRect(cx - 7, cy - 7, 14, 2);
 
+  // Armor accent — gold rivets
+  if (t.kind === "armor") {
+    ctx.fillStyle = "#7c2d12";
+    ctx.fillRect(cx - 4, cy - 4, 2, 2);
+    ctx.fillRect(cx + 2, cy - 4, 2, 2);
+    ctx.fillRect(cx - 4, cy + 2, 2, 2);
+    ctx.fillRect(cx + 2, cy + 2, 2, 2);
+  }
+
+  // HP indicator for multi-hit tanks
+  if (t.hp > 1) {
+    ctx.fillStyle = "#ef4444";
+    for (let i = 0; i < t.hp; i++) {
+      ctx.fillRect(x + 4 + i * 4, y + 2, 3, 2);
+    }
+  }
+
   // Barrel
   ctx.fillStyle = dark;
   const bw = 4;
@@ -1024,7 +1282,7 @@ function drawTank(
   else if (dir === "left") ctx.fillRect(cx - bl, cy - bw / 2, bl, bw);
   else ctx.fillRect(cx, cy - bw / 2, bl, bw);
 
-  // Hatch dot on turret (visible direction marker)
+  // Hatch dot
   ctx.fillStyle = "rgba(0,0,0,0.4)";
   ctx.fillRect(cx - 1, cy - 1, 2, 2);
 }
@@ -1034,14 +1292,11 @@ function drawExplosion(ctx: CanvasRenderingContext2D, e: Explosion) {
   const tt = e.age / maxAge;
   const radius = e.big ? 16 : 8;
   const r = radius * (0.4 + tt * 0.8);
-  // Outer flash
   ctx.fillStyle = tt < 0.4 ? "#fef3c7" : "rgba(254,243,199,0.6)";
   ctx.fillRect(e.x - r, e.y - r, r * 2, r * 2);
-  // Inner core
   ctx.fillStyle = tt < 0.5 ? "#f59e0b" : "#dc2626";
   const ir = r * 0.6;
   ctx.fillRect(e.x - ir, e.y - ir, ir * 2, ir * 2);
-  // Sparks
   if (e.big && tt < 0.6) {
     ctx.fillStyle = "#fef3c7";
     for (let i = 0; i < 4; i++) {
