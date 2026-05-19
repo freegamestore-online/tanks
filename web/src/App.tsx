@@ -47,6 +47,7 @@ const ENEMY_POINTS: Record<EnemyKind, number> = { basic: 100, fast: 200, armor: 
 const ENEMY_HP: Record<EnemyKind, number> = { basic: 1, fast: 1, armor: 3 };
 
 interface Tank {
+  id: number;
   x: number;
   y: number;
   dir: Dir;
@@ -60,6 +61,7 @@ interface Tank {
 }
 
 interface Bullet {
+  ownerId: number; // tank.id that fired
   x: number;
   y: number;
   dir: Dir;
@@ -101,6 +103,7 @@ interface GameState {
   gameOver: boolean;
   frame: number;
   time: number;
+  nextTankId: number;
 }
 
 // ──────────── LEVELS ────────────
@@ -268,8 +271,10 @@ function canTankOccupy(field: Tile[][], x: number, y: number): boolean {
 
 const PLAYER_SPAWN = { x: 3 * TILE_PX, y: 10 * TILE_PX };
 
+// Player always reuses id=0 across respawns — that's the unique "player slot".
 function freshPlayer(): Tank {
   return {
+    id: 0,
     x: PLAYER_SPAWN.x,
     y: PLAYER_SPAWN.y,
     dir: "up",
@@ -304,6 +309,7 @@ function freshStateForStage(stage: number, carryLives: number, carryScore: numbe
     gameOver: false,
     frame: 0,
     time: 0,
+    nextTankId: 1, // 0 reserved for player
   };
 }
 
@@ -324,6 +330,7 @@ function spawnEnemy(s: GameState): boolean {
     if (s.player.alive && intersects(tankAabb(s.player), tryBox)) overlap = true;
     if (overlap) continue;
     s.enemies.push({
+      id: s.nextTankId++,
       x: spot.x,
       y: spot.y,
       dir: "down",
@@ -364,12 +371,17 @@ function tryMove(
 
 function fire(t: Tank, s: GameState): boolean {
   if (t.cooldown > 0) return false;
+  // NES rule: one bullet per tank in flight at a time.
+  for (const b of s.bullets) {
+    if (b.alive && b.ownerId === t.id) return false;
+  }
   t.cooldown = FIRE_COOLDOWN;
   const v = DIR_VEC[t.dir];
   const cx = t.x + TANK_SIZE / 2;
   const cy = t.y + TANK_SIZE / 2;
   const offset = TANK_SIZE / 2 + 2;
   s.bullets.push({
+    ownerId: t.id,
     x: cx + v.dx * offset - 2,
     y: cy + v.dy * offset - 2,
     dir: t.dir,
@@ -382,6 +394,9 @@ function fire(t: Tank, s: GameState): boolean {
 
 // Check the bullet's full 4×4 box vs the tile grid. Smash every brick the
 // box overlaps in one shot (perpendicular shots take out two bricks).
+// Outcome priority: base > brick > steel > none. Even if a corner clips
+// steel, if the bullet also smashed brick, we report "brick" so the right
+// sound + popup play.
 function damageBullet(s: GameState, b: Bullet): "brick" | "steel" | "base" | null {
   const pts: ReadonlyArray<readonly [number, number]> = [
     [b.x, b.y],
@@ -389,7 +404,9 @@ function damageBullet(s: GameState, b: Bullet): "brick" | "steel" | "base" | nul
     [b.x, b.y + 3],
     [b.x + 3, b.y + 3],
   ];
-  let result: "brick" | "steel" | "base" | null = null;
+  let hitBase = false;
+  let hitBrick = false;
+  let hitSteel = false;
   const bricks: Array<[number, number]> = [];
   const seen = new Set<string>();
   for (const [px, py] of pts) {
@@ -402,17 +419,20 @@ function damageBullet(s: GameState, b: Bullet): "brick" | "steel" | "base" | nul
     const t = s.field[r]![c]!;
     if (t === T_BRICK) {
       bricks.push([r, c]);
-      if (!result) result = "brick";
+      hitBrick = true;
     } else if (t === T_STEEL) {
-      if (result !== "base") result = "steel";
+      hitSteel = true;
     } else if (t === T_EAGLE) {
       s.baseAlive = false;
       s.gameOver = true;
-      result = "base";
+      hitBase = true;
     }
   }
   if (bricks.length > 0) for (const [r, c] of bricks) s.field[r]![c] = T_EMPTY;
-  return result;
+  if (hitBase) return "base";
+  if (hitBrick) return "brick";
+  if (hitSteel) return "steel";
+  return null;
 }
 
 // ──────────── React component ────────────
@@ -463,6 +483,11 @@ export default function App() {
     const cur = stateRef.current;
     const nextStage = cur.stage + 1;
     if (nextStage > LEVELS.length) {
+      // Player beat every stage — record the win as the top of the score
+      // ladder. (Was previously a silent miss: bestScore/bestStage only
+      // updated on the game-over path.)
+      updateHighScore(cur.totalScore);
+      updateBestStage(cur.stage);
       setPhase("won");
       sounds.playLevelUp();
       return;
@@ -475,7 +500,7 @@ export default function App() {
     setKills(0);
     setStageClearSummary(null);
     setPhase("stage-intro");
-  }, [sounds]);
+  }, [sounds, updateHighScore, updateBestStage]);
 
   // Keyboard
   useEffect(() => {
@@ -663,6 +688,7 @@ export default function App() {
               sounds.playMove();
               s.explosions.push({ x: cx, y: cy, age: 0, big: false });
             } else if (wall === "steel") {
+              sounds.playTick();
               s.explosions.push({ x: cx, y: cy, age: 0, big: false });
             } else if (wall === "base") {
               sounds.playGameOver();
