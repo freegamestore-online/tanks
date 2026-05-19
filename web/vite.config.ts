@@ -39,7 +39,7 @@ export default defineConfig({
         short_name: "bubbleshooter",
         description: "bubbleshooter — free forever",
         start_url: "/",
-        display: "standalone", orientation: "any", min_viewport_width: 360,
+        display: "standalone", orientation: "any",
         background_color: "#0f0f0f",
         theme_color: "#2563eb",
         icons: [
