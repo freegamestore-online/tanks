@@ -8,23 +8,23 @@ import {
 } from "@freegamestore/games";
 import { useHighScore } from "./hooks/useHighScore";
 
-// Battle-City-style 13×13 field, NES-era look. Two tiles per tank.
+// Battle-City-style 13×13 field. Two-tile tanks, NES feel.
 
 const COLS = 13;
 const ROWS = 13;
-const TILE_PX = 28; // logical pixels per tile — canvas scales via CSS
+const TILE_PX = 28;
 const FIELD_W = COLS * TILE_PX;
 const FIELD_H = ROWS * TILE_PX;
 
 const TANK_SIZE = 2 * TILE_PX;
-const TANK_SPEED = 0.085; // px per ms — feels close to NES
-const BULLET_SPEED = 0.32;
+const TANK_SPEED = 0.12; // px per ms
+const BULLET_SPEED = 0.36;
 const FIRE_COOLDOWN = 380;
 
-const ENEMY_GOAL = 8; // destroy this many to win
+const ENEMY_GOAL = 8;
 const START_LIVES = 3;
+const MAX_LIVE_ENEMIES = 3;
 
-// Tile types
 const T_EMPTY = 0;
 const T_BRICK = 1;
 const T_STEEL = 2;
@@ -48,7 +48,8 @@ interface Tank {
   isEnemy: boolean;
   alive: boolean;
   cooldown: number;
-  aiTimer: number; // ms until next AI decision
+  aiTimer: number;
+  spawnFlash: number; // ms remaining of "just spawned" flash
 }
 
 interface Bullet {
@@ -57,40 +58,49 @@ interface Bullet {
   dir: Dir;
   ownerEnemy: boolean;
   alive: boolean;
+  trail: Array<{ x: number; y: number }>;
+}
+
+interface Explosion {
+  x: number;
+  y: number;
+  age: number; // ms since start
+  big: boolean;
 }
 
 interface GameState {
-  field: Tile[][]; // [row][col]
+  field: Tile[][];
   player: Tank;
   enemies: Tank[];
   bullets: Bullet[];
+  explosions: Explosion[];
   spawnTimer: number;
-  spawnQueue: number; // enemies left to spawn this level
-  destroyed: number; // total enemies destroyed
+  spawnQueue: number;
+  destroyed: number;
   lives: number;
   baseAlive: boolean;
   gameOver: boolean;
   victory: boolean;
+  frame: number;
+  time: number;
 }
 
-// Classic-ish Battle City layout. B=brick, S=steel, W=water, X=bush.
-// Eagle (E) at bottom center, protected by a brick "house".
-//
-// Pad to 13 chars per row exactly.
+// 13×13 layout. Player spawns at (col 3, row 10), occupying cols 3-4, rows 10-11.
+// Eagle at row 12 col 6, protected by bricks at (11, 5-7), (12, 5), (12, 7).
 const LAYOUT: string[] = [
-  ".............",
-  "..BB...BB....",
-  "..BB...BB....",
-  "BBBBBB.BBBBBB",
-  "B.B.B.B.B.B.B",
-  "...........X.",
-  ".....SS......",
-  ".X.....X.....",
-  "BBBBBBBBBBBBB",
-  "B.....B.....B",
-  "B..B..B..B..B",
-  "B..B..B..B..B",
-  "BBBBBEBBBBBBB",
+  ".............", //  0
+  "..BB.....BB..", //  1
+  "..BB.....BB..", //  2
+  ".............", //  3
+  "BBBB.....BBBB", //  4
+  ".....SSS.....", //  5
+  "X..X.....X..X", //  6  (bushes for cover)
+  ".....SSS.....", //  7
+  "BBBB.....BBBB", //  8
+  ".............", //  9
+  ".............", // 10  ← player spawn area (cols 3-4)
+  ".....BBB.....", // 11
+  ".....BEB.....", // 12
 ];
 
 function parseField(): Tile[][] {
@@ -128,7 +138,7 @@ function intersects(
 function tileAt(field: Tile[][], px: number, py: number): Tile {
   const c = Math.floor(px / TILE_PX);
   const r = Math.floor(py / TILE_PX);
-  if (r < 0 || r >= ROWS || c < 0 || c >= COLS) return T_STEEL; // off-field = wall
+  if (r < 0 || r >= ROWS || c < 0 || c >= COLS) return T_STEEL;
   return field[r]![c]!;
 }
 
@@ -136,10 +146,8 @@ function blocksTank(t: Tile): boolean {
   return t === T_BRICK || t === T_STEEL || t === T_WATER || t === T_EAGLE;
 }
 
-// Sample many points along the tank's leading edge to check for wall blockers.
 function canTankOccupy(field: Tile[][], x: number, y: number): boolean {
   if (x < 0 || y < 0 || x + TANK_SIZE > FIELD_W || y + TANK_SIZE > FIELD_H) return false;
-  // Check corners + midpoints (5 samples per side is plenty for tank-vs-tile)
   const eps = 1;
   const pts = [
     [x + eps, y + eps],
@@ -157,33 +165,41 @@ function canTankOccupy(field: Tile[][], x: number, y: number): boolean {
   return true;
 }
 
-function freshState(): GameState {
-  const field = parseField();
+const PLAYER_SPAWN = { x: 3 * TILE_PX, y: 10 * TILE_PX };
+
+function freshPlayer(): Tank {
   return {
-    field,
-    player: {
-      x: 4 * TILE_PX,
-      y: 11 * TILE_PX,
-      dir: "up",
-      isEnemy: false,
-      alive: true,
-      cooldown: 0,
-      aiTimer: 0,
-    },
+    x: PLAYER_SPAWN.x,
+    y: PLAYER_SPAWN.y,
+    dir: "up",
+    isEnemy: false,
+    alive: true,
+    cooldown: 0,
+    aiTimer: 0,
+    spawnFlash: 700,
+  };
+}
+
+function freshState(): GameState {
+  return {
+    field: parseField(),
+    player: freshPlayer(),
     enemies: [],
     bullets: [],
-    spawnTimer: 600,
+    explosions: [],
+    spawnTimer: 500,
     spawnQueue: ENEMY_GOAL,
     destroyed: 0,
     lives: START_LIVES,
     baseAlive: true,
     gameOver: false,
     victory: false,
+    frame: 0,
+    time: 0,
   };
 }
 
 function spawnEnemy(s: GameState): boolean {
-  // Try the 3 standard spawn points at top of field
   const spots = [
     { x: 0, y: 0 },
     { x: (COLS / 2 - 1) * TILE_PX, y: 0 },
@@ -191,7 +207,6 @@ function spawnEnemy(s: GameState): boolean {
   ];
   for (const spot of spots) {
     if (!canTankOccupy(s.field, spot.x, spot.y)) continue;
-    // Don't overlap an existing tank
     const tryBox = { x: spot.x, y: spot.y, w: TANK_SIZE, h: TANK_SIZE };
     let overlap = false;
     for (const e of s.enemies) if (e.alive && intersects(tankAabb(e), tryBox)) { overlap = true; break; }
@@ -203,8 +218,9 @@ function spawnEnemy(s: GameState): boolean {
       dir: "down",
       isEnemy: true,
       alive: true,
-      cooldown: 600,
+      cooldown: 700,
       aiTimer: 200 + Math.random() * 600,
+      spawnFlash: 500,
     });
     return true;
   }
@@ -235,12 +251,11 @@ function fire(t: Tank, s: GameState): boolean {
     dir: t.dir,
     ownerEnemy: t.isEnemy,
     alive: true,
+    trail: [],
   });
   return true;
 }
 
-// Damage a brick tile cluster: when a bullet hits brick, smash a small chunk
-// around the impact (1 tile here for simplicity).
 function damageWall(s: GameState, px: number, py: number): "brick" | "steel" | "base" | null {
   const c = Math.floor(px / TILE_PX);
   const r = Math.floor(py / TILE_PX);
@@ -266,6 +281,8 @@ export default function App() {
     { up: false, down: false, left: false, right: false, fire: false },
   );
   const lastTimeRef = useRef(0);
+  const destroyedRef = useRef(0);
+  const livesRef = useRef(START_LIVES);
 
   const [score, setScore] = useState(0);
   const [lives, setLives] = useState(START_LIVES);
@@ -277,6 +294,9 @@ export default function App() {
 
   const start = useCallback(() => {
     stateRef.current = freshState();
+    destroyedRef.current = 0;
+    livesRef.current = START_LIVES;
+    lastTimeRef.current = 0;
     setScore(0);
     setLives(START_LIVES);
     setDestroyed(0);
@@ -292,7 +312,8 @@ export default function App() {
         case "ArrowDown": case "s": case "S": inputRef.current.down = true; e.preventDefault(); break;
         case "ArrowLeft": case "a": case "A": inputRef.current.left = true; e.preventDefault(); break;
         case "ArrowRight": case "d": case "D": inputRef.current.right = true; e.preventDefault(); break;
-        case " ": case "Enter": case "k": case "K": inputRef.current.fire = true; e.preventDefault(); break;
+        case " ": case "Enter": case "k": case "K": case "x": case "X":
+          inputRef.current.fire = true; e.preventDefault(); break;
       }
     };
     const up = (e: KeyboardEvent) => {
@@ -301,7 +322,8 @@ export default function App() {
         case "ArrowDown": case "s": case "S": inputRef.current.down = false; break;
         case "ArrowLeft": case "a": case "A": inputRef.current.left = false; break;
         case "ArrowRight": case "d": case "D": inputRef.current.right = false; break;
-        case " ": case "Enter": case "k": case "K": inputRef.current.fire = false; break;
+        case " ": case "Enter": case "k": case "K": case "x": case "X":
+          inputRef.current.fire = false; break;
       }
     };
     window.addEventListener("keydown", down);
@@ -341,14 +363,17 @@ export default function App() {
     return () => ro.disconnect();
   }, []);
 
-  // Main loop
+  // Animation loop
   useEffect(() => {
     let raf = 0;
     const tick = (now: number) => {
       const dt = lastTimeRef.current === 0 ? 16 : Math.min(40, now - lastTimeRef.current);
       lastTimeRef.current = now;
-      if (phase === "playing") step(stateRef.current, dt);
-      draw(stateRef.current);
+      const s = stateRef.current;
+      s.frame++;
+      s.time += dt;
+      if (phase === "playing") step(s, dt);
+      draw(s);
       raf = requestAnimationFrame(tick);
     };
     raf = requestAnimationFrame(tick);
@@ -356,177 +381,191 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [phase]);
 
-  const step = useCallback((s: GameState, dt: number) => {
-    // ── Player input → movement + fire
-    if (s.player.alive) {
-      const inp = inputRef.current;
-      let newDir: Dir | null = null;
-      if (inp.up) newDir = "up";
-      else if (inp.down) newDir = "down";
-      else if (inp.left) newDir = "left";
-      else if (inp.right) newDir = "right";
-      if (newDir) {
-        // Allow turning while moving: snap to grid on perpendicular turns for cleanness
-        if (newDir !== s.player.dir) {
-          if (newDir === "up" || newDir === "down") {
-            s.player.x = Math.round(s.player.x / TILE_PX) * TILE_PX;
-          } else {
-            s.player.y = Math.round(s.player.y / TILE_PX) * TILE_PX;
+  const step = useCallback(
+    (s: GameState, dt: number) => {
+      // Player movement
+      if (s.player.alive) {
+        s.player.spawnFlash = Math.max(0, s.player.spawnFlash - dt);
+        s.player.cooldown = Math.max(0, s.player.cooldown - dt);
+        const inp = inputRef.current;
+        let newDir: Dir | null = null;
+        if (inp.up) newDir = "up";
+        else if (inp.down) newDir = "down";
+        else if (inp.left) newDir = "left";
+        else if (inp.right) newDir = "right";
+        if (newDir) {
+          // Snap to grid on perpendicular turn (NES Battle City feel)
+          if (newDir !== s.player.dir) {
+            if (newDir === "up" || newDir === "down") {
+              s.player.x = Math.round(s.player.x / TILE_PX) * TILE_PX;
+            } else {
+              s.player.y = Math.round(s.player.y / TILE_PX) * TILE_PX;
+            }
           }
+          s.player.dir = newDir;
+          const v = DIR_VEC[newDir];
+          tryMove(s.field, s.player, v.dx * TANK_SPEED * dt, v.dy * TANK_SPEED * dt);
         }
-        s.player.dir = newDir;
-        const v = DIR_VEC[newDir];
-        tryMove(s.field, s.player, v.dx * TANK_SPEED * dt, v.dy * TANK_SPEED * dt);
-      }
-      s.player.cooldown = Math.max(0, s.player.cooldown - dt);
-      if (inp.fire && s.player.cooldown === 0) {
-        if (fire(s.player, s)) sounds.playMove();
-      }
-    }
-
-    // ── Enemy AI
-    for (const e of s.enemies) {
-      if (!e.alive) continue;
-      e.cooldown = Math.max(0, e.cooldown - dt);
-      e.aiTimer -= dt;
-      if (e.aiTimer <= 0) {
-        // Pick a new direction. Prefer toward base or player ~60% of the time.
-        const targetX = Math.random() < 0.5 ? s.player.x : (COLS / 2 - 1) * TILE_PX;
-        const targetY = Math.random() < 0.5 ? s.player.y : (ROWS - 2) * TILE_PX;
-        const choices: Dir[] = ["up", "down", "left", "right"];
-        if (Math.random() < 0.6) {
-          const dx = targetX - e.x;
-          const dy = targetY - e.y;
-          if (Math.abs(dx) > Math.abs(dy)) {
-            choices.unshift(dx > 0 ? "right" : "left");
-          } else {
-            choices.unshift(dy > 0 ? "down" : "up");
-          }
-        } else {
-          // Shuffle
-          for (let i = choices.length - 1; i > 0; i--) {
-            const j = Math.floor(Math.random() * (i + 1));
-            [choices[i], choices[j]] = [choices[j]!, choices[i]!];
-          }
+        if (inp.fire && s.player.cooldown === 0) {
+          if (fire(s.player, s)) sounds.playMove();
         }
-        e.dir = choices[0]!;
-        e.aiTimer = 600 + Math.random() * 1200;
-      }
-      const v = DIR_VEC[e.dir];
-      const moved = tryMove(s.field, e, v.dx * TANK_SPEED * 0.85 * dt, v.dy * TANK_SPEED * 0.85 * dt);
-      if (!moved && e.aiTimer > 200) e.aiTimer = 100; // bounced — redecide soon
-      // Fire toward player on alignment
-      if (e.cooldown === 0 && Math.random() < 0.012) {
-        fire(e, s);
-      }
-    }
-
-    // ── Spawning
-    if (s.spawnQueue > 0) {
-      s.spawnTimer -= dt;
-      if (s.spawnTimer <= 0 && s.enemies.filter((e) => e.alive).length < 3) {
-        if (spawnEnemy(s)) s.spawnQueue--;
-        s.spawnTimer = 1400;
-      }
-    }
-
-    // ── Bullet update + collisions
-    const liveBullets: Bullet[] = [];
-    for (const b of s.bullets) {
-      if (!b.alive) continue;
-      const v = DIR_VEC[b.dir];
-      b.x += v.dx * BULLET_SPEED * dt;
-      b.y += v.dy * BULLET_SPEED * dt;
-      const cx = b.x + 2;
-      const cy = b.y + 2;
-      if (cx < 0 || cx > FIELD_W || cy < 0 || cy > FIELD_H) continue;
-
-      // Wall collision
-      const wall = damageWall(s, cx, cy);
-      if (wall) {
-        if (wall === "brick") sounds.playMove();
-        if (wall === "base") sounds.playGameOver();
-        continue;
       }
 
-      // Tank collisions
-      const bbox = { x: b.x, y: b.y, w: 4, h: 4 };
-      let hit = false;
+      // Enemy AI
+      for (const e of s.enemies) {
+        if (!e.alive) continue;
+        e.spawnFlash = Math.max(0, e.spawnFlash - dt);
+        e.cooldown = Math.max(0, e.cooldown - dt);
+        if (e.spawnFlash > 0) continue; // can't move during spawn flash
+        e.aiTimer -= dt;
+        if (e.aiTimer <= 0) {
+          const choices: Dir[] = ["up", "down", "left", "right"];
+          if (Math.random() < 0.65) {
+            // Bias toward player or base (whichever closer)
+            const tx = Math.random() < 0.5 ? s.player.x : 5 * TILE_PX;
+            const ty = Math.random() < 0.5 ? s.player.y : 12 * TILE_PX;
+            const dx = tx - e.x;
+            const dy = ty - e.y;
+            if (Math.abs(dx) > Math.abs(dy)) {
+              choices.unshift(dx > 0 ? "right" : "left");
+            } else {
+              choices.unshift(dy > 0 ? "down" : "up");
+            }
+          } else {
+            for (let i = choices.length - 1; i > 0; i--) {
+              const j = Math.floor(Math.random() * (i + 1));
+              [choices[i], choices[j]] = [choices[j]!, choices[i]!];
+            }
+          }
+          // Snap to grid on turn
+          const next = choices[0]!;
+          if (next !== e.dir) {
+            if (next === "up" || next === "down") {
+              e.x = Math.round(e.x / TILE_PX) * TILE_PX;
+            } else {
+              e.y = Math.round(e.y / TILE_PX) * TILE_PX;
+            }
+          }
+          e.dir = next;
+          e.aiTimer = 800 + Math.random() * 1400;
+        }
+        const v = DIR_VEC[e.dir];
+        const moved = tryMove(s.field, e, v.dx * TANK_SPEED * 0.8 * dt, v.dy * TANK_SPEED * 0.8 * dt);
+        if (!moved && e.aiTimer > 250) e.aiTimer = 120;
+        if (e.cooldown === 0 && Math.random() < 0.015) fire(e, s);
+      }
 
-      if (!b.ownerEnemy) {
-        for (const e of s.enemies) {
-          if (!e.alive) continue;
-          if (intersects(bbox, tankAabb(e))) {
-            e.alive = false;
-            s.destroyed++;
-            hit = true;
-            sounds.playError();
+      // Spawning
+      if (s.spawnQueue > 0) {
+        s.spawnTimer -= dt;
+        const alive = s.enemies.reduce((n, e) => n + (e.alive ? 1 : 0), 0);
+        if (s.spawnTimer <= 0 && alive < MAX_LIVE_ENEMIES) {
+          if (spawnEnemy(s)) s.spawnQueue--;
+          s.spawnTimer = 1500;
+        }
+      }
+
+      // Bullets
+      const liveBullets: Bullet[] = [];
+      for (const b of s.bullets) {
+        if (!b.alive) continue;
+        const v = DIR_VEC[b.dir];
+        // Sub-step bullets to prevent tunneling through walls
+        const steps = 2;
+        let hit: "wall" | "tank" | "edge" | null = null;
+        for (let i = 0; i < steps && !hit; i++) {
+          b.trail.push({ x: b.x + 2, y: b.y + 2 });
+          if (b.trail.length > 4) b.trail.shift();
+          b.x += (v.dx * BULLET_SPEED * dt) / steps;
+          b.y += (v.dy * BULLET_SPEED * dt) / steps;
+          const cx = b.x + 2;
+          const cy = b.y + 2;
+          if (cx < 0 || cx > FIELD_W || cy < 0 || cy > FIELD_H) { hit = "edge"; break; }
+          const wall = damageWall(s, cx, cy);
+          if (wall) {
+            if (wall === "brick") {
+              sounds.playMove();
+              s.explosions.push({ x: cx, y: cy, age: 0, big: false });
+            } else if (wall === "base") {
+              sounds.playGameOver();
+              s.explosions.push({ x: cx, y: cy, age: 0, big: true });
+            }
+            hit = "wall";
             break;
           }
+          const bbox = { x: b.x, y: b.y, w: 4, h: 4 };
+          if (!b.ownerEnemy) {
+            for (const e of s.enemies) {
+              if (!e.alive) continue;
+              if (intersects(bbox, tankAabb(e))) {
+                e.alive = false;
+                s.destroyed++;
+                s.explosions.push({ x: e.x + TANK_SIZE / 2, y: e.y + TANK_SIZE / 2, age: 0, big: true });
+                hit = "tank";
+                sounds.playError();
+                break;
+              }
+            }
+          } else if (s.player.alive && s.player.spawnFlash === 0 && intersects(bbox, tankAabb(s.player))) {
+            s.player.alive = false;
+            s.explosions.push({ x: s.player.x + TANK_SIZE / 2, y: s.player.y + TANK_SIZE / 2, age: 0, big: true });
+            hit = "tank";
+            sounds.playError();
+          }
         }
-      } else if (s.player.alive && intersects(bbox, tankAabb(s.player))) {
-        s.player.alive = false;
-        hit = true;
-        sounds.playError();
+        if (!hit) liveBullets.push(b);
       }
+      s.bullets = liveBullets;
 
-      if (!hit) liveBullets.push(b);
-    }
-    s.bullets = liveBullets;
+      // Explosions age
+      const liveExplosions: Explosion[] = [];
+      for (const e of s.explosions) {
+        e.age += dt;
+        if (e.age < (e.big ? 350 : 200)) liveExplosions.push(e);
+      }
+      s.explosions = liveExplosions;
 
-    // ── Cull dead enemies (keep alive list lean)
-    s.enemies = s.enemies.filter((e) => e.alive || s.bullets.length > 0); // keep until next pass
-    s.enemies = s.enemies.filter((e) => e.alive);
+      // Cull dead enemies
+      s.enemies = s.enemies.filter((e) => e.alive);
 
-    // ── Player respawn / lives / win / lose
-    if (!s.player.alive && !s.gameOver) {
-      if (s.lives > 1) {
-        s.lives--;
-        // Respawn at start tile
-        s.player = {
-          x: 4 * TILE_PX,
-          y: 11 * TILE_PX,
-          dir: "up",
-          isEnemy: false,
-          alive: true,
-          cooldown: 600,
-          aiTimer: 0,
-        };
-      } else {
-        s.lives = 0;
+      // Player respawn / lives / win / lose
+      if (!s.player.alive && !s.gameOver) {
+        if (s.lives > 1) {
+          s.lives--;
+          s.player = freshPlayer();
+        } else {
+          s.lives = 0;
+          s.gameOver = true;
+        }
+      }
+      if (!s.baseAlive) s.gameOver = true;
+      if (s.destroyed >= ENEMY_GOAL && !s.gameOver) {
         s.gameOver = true;
+        s.victory = true;
       }
-    }
-    if (!s.baseAlive) s.gameOver = true;
-    if (s.destroyed >= ENEMY_GOAL && !s.gameOver) {
-      s.gameOver = true;
-      s.victory = true;
-    }
 
-    // ── React state sync (cheap diffs)
-    if (s.destroyed !== destroyedRef.current) {
-      destroyedRef.current = s.destroyed;
-      setDestroyed(s.destroyed);
-      setScore(s.destroyed * 100);
-    }
-    if (s.lives !== livesRef.current) {
-      livesRef.current = s.lives;
-      setLives(s.lives);
-    }
-    if (s.gameOver && phase === "playing") {
-      const won = s.victory && s.baseAlive;
-      setPhase(won ? "won" : "over");
-      const final = s.destroyed * 100 + (won ? 500 : 0);
-      setScore(final);
-      updateHighScore(final);
-      if (won) sounds.playLevelUp();
-      else sounds.playGameOver();
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [phase, sounds, updateHighScore]);
-
-  const destroyedRef = useRef(0);
-  const livesRef = useRef(START_LIVES);
+      // Sync React state minimally
+      if (s.destroyed !== destroyedRef.current) {
+        destroyedRef.current = s.destroyed;
+        setDestroyed(s.destroyed);
+        setScore(s.destroyed * 100);
+      }
+      if (s.lives !== livesRef.current) {
+        livesRef.current = s.lives;
+        setLives(s.lives);
+      }
+      if (s.gameOver && phase === "playing") {
+        const won = s.victory && s.baseAlive;
+        setPhase(won ? "won" : "over");
+        const final = s.destroyed * 100 + (won ? 500 : 0);
+        setScore(final);
+        updateHighScore(final);
+        if (won) sounds.playLevelUp();
+        else sounds.playGameOver();
+      }
+    },
+    [phase, sounds, updateHighScore],
+  );
 
   const draw = useCallback((s: GameState) => {
     const canvas = canvasRef.current;
@@ -537,43 +576,65 @@ export default function App() {
     ctx.fillStyle = "#0a0a0a";
     ctx.fillRect(0, 0, FIELD_W, FIELD_H);
 
-    // Tiles
+    // Subtle grid for arcade feel
+    ctx.strokeStyle = "rgba(255,255,255,0.025)";
+    ctx.lineWidth = 1;
+    for (let i = 0; i <= COLS; i++) {
+      ctx.beginPath();
+      ctx.moveTo(i * TILE_PX + 0.5, 0);
+      ctx.lineTo(i * TILE_PX + 0.5, FIELD_H);
+      ctx.stroke();
+    }
+    for (let j = 0; j <= ROWS; j++) {
+      ctx.beginPath();
+      ctx.moveTo(0, j * TILE_PX + 0.5);
+      ctx.lineTo(FIELD_W, j * TILE_PX + 0.5);
+      ctx.stroke();
+    }
+
+    // Tiles under tanks (skip bushes — bushes go on top)
     for (let r = 0; r < ROWS; r++) {
       for (let c = 0; c < COLS; c++) {
         const t = s.field[r]![c]!;
-        if (t === T_EMPTY) continue;
-        const x = c * TILE_PX;
-        const y = r * TILE_PX;
-        drawTile(ctx, x, y, t);
+        if (t === T_EMPTY || t === T_BUSH) continue;
+        drawTile(ctx, c * TILE_PX, r * TILE_PX, t, s.time);
       }
+    }
+
+    // Bullet trails first
+    for (const b of s.bullets) {
+      ctx.fillStyle = "rgba(254,243,199,0.4)";
+      for (const p of b.trail) ctx.fillRect(p.x - 1, p.y - 1, 3, 3);
     }
 
     // Bullets
     for (const b of s.bullets) {
-      ctx.fillStyle = "#fde68a";
+      ctx.fillStyle = "#fef3c7";
       ctx.fillRect(b.x, b.y, 4, 4);
     }
 
-    // Tanks (player + enemies)
-    if (s.player.alive) drawTank(ctx, s.player, "#facc15", "#1f2937");
+    // Tanks
+    if (s.player.alive) drawTank(ctx, s.player, "#facc15", "#7c2d12", s.frame);
     for (const e of s.enemies) {
       if (!e.alive) continue;
-      drawTank(ctx, e, "#94a3b8", "#0f172a");
+      drawTank(ctx, e, "#cbd5e1", "#1e293b", s.frame);
     }
 
-    // Bushes go ON TOP of tanks (cover)
+    // Bushes on top (cover)
     for (let r = 0; r < ROWS; r++) {
       for (let c = 0; c < COLS; c++) {
-        if (s.field[r]![c] === T_BUSH) drawTile(ctx, c * TILE_PX, r * TILE_PX, T_BUSH);
+        if (s.field[r]![c] === T_BUSH) drawTile(ctx, c * TILE_PX, r * TILE_PX, T_BUSH, s.time);
       }
     }
+
+    // Explosions on top of everything
+    for (const ex of s.explosions) drawExplosion(ctx, ex);
   }, []);
 
-  // ── Touch controls
+  // Touch controls
   const setInput = (key: keyof typeof inputRef.current, v: boolean) => {
     inputRef.current[key] = v;
     if (key !== "fire" && v) {
-      // Clear other directions when pressing a new one
       const others: Array<keyof typeof inputRef.current> = ["up", "down", "left", "right"];
       for (const o of others) if (o !== key) inputRef.current[o] = false;
     }
@@ -619,19 +680,19 @@ export default function App() {
           rules={
             <div>
               <h3 style={{ marginBottom: "0.5rem", fontWeight: 700 }}>Tanks</h3>
-              <p>Defend your eagle and destroy {ENEMY_GOAL} enemy tanks.</p>
+              <p>Defend the eagle and destroy {ENEMY_GOAL} enemy tanks.</p>
               <h4 style={{ marginTop: "0.75rem", fontWeight: 600 }}>Controls</h4>
               <ul style={{ paddingLeft: "1.2rem", marginTop: "0.25rem" }}>
-                <li>Desktop: ← ↑ → ↓ (or WASD) to move, Space / Enter / K to fire</li>
-                <li>Mobile: D-pad bottom-left, Fire bottom-right</li>
+                <li>Desktop: arrows (or WASD) to move, Space / Enter / X / K to fire</li>
+                <li>Mobile: D-pad + Fire button below the field</li>
               </ul>
               <h4 style={{ marginTop: "0.75rem", fontWeight: 600 }}>Rules</h4>
               <ul style={{ paddingLeft: "1.2rem", marginTop: "0.25rem" }}>
-                <li>3 lives. Lose all = game over</li>
-                <li>If the eagle base is hit, you lose instantly — keep the bricks around it intact</li>
+                <li>3 lives. Lose all = game over.</li>
+                <li>If the eagle is hit you lose instantly — keep its brick ring intact.</li>
                 <li>Brick walls crumble. Steel walls don't.</li>
-                <li>Bushes hide tanks (cover both you and enemies)</li>
-                <li>Survive bonus +500 for clearing all enemies with the base intact</li>
+                <li>Bushes hide tanks (cover for both sides).</li>
+                <li>Survive bonus +500 for clearing all enemies with the base intact.</li>
               </ul>
             </div>
           }
@@ -666,17 +727,21 @@ export default function App() {
             style={{
               imageRendering: "pixelated",
               background: "#0a0a0a",
-              border: "1px solid var(--line)",
+              border: "2px solid #1f2937",
               borderRadius: "0.25rem",
               maxWidth: "100%",
               maxHeight: "100%",
               touchAction: "none",
+              boxShadow: "0 0 0 1px #facc15 inset, 0 4px 24px rgba(0,0,0,0.4)",
             }}
           />
           {phase === "intro" && (
             <Overlay>
               <div style={{ fontFamily: "Fraunces, serif", fontWeight: 800, fontSize: "1.5rem", color: "#facc15" }}>
                 Defend the eagle
+              </div>
+              <div style={{ color: "var(--paper)", fontSize: "0.85rem", textAlign: "center", maxWidth: "16rem" }}>
+                Arrows / WASD to move · Space / X to fire
               </div>
               <GameButton size="md" variant="primary" onClick={start}>Start</GameButton>
             </Overlay>
@@ -743,6 +808,7 @@ export default function App() {
               touchAction: "manipulation",
               userSelect: "none",
               WebkitUserSelect: "none",
+              boxShadow: "0 4px 0 rgba(0,0,0,0.25)",
             }}
           >
             FIRE
@@ -773,7 +839,7 @@ function Overlay({ children }: { children: React.ReactNode }) {
         alignItems: "center",
         justifyContent: "center",
         gap: "0.75rem",
-        background: "rgba(10,10,10,0.8)",
+        background: "rgba(10,10,10,0.82)",
         borderRadius: "0.25rem",
       }}
     >
@@ -782,76 +848,184 @@ function Overlay({ children }: { children: React.ReactNode }) {
   );
 }
 
-function drawTile(ctx: CanvasRenderingContext2D, x: number, y: number, t: Tile) {
+function drawTile(ctx: CanvasRenderingContext2D, x: number, y: number, t: Tile, time: number) {
   if (t === T_BRICK) {
-    // 4-quadrant brick pattern
-    ctx.fillStyle = "#a04020";
+    // Two rows of bricks per tile, staggered. Mortar lines visible.
+    ctx.fillStyle = "#5b1d0e";
     ctx.fillRect(x, y, TILE_PX, TILE_PX);
-    ctx.fillStyle = "#7a2f17";
+    ctx.fillStyle = "#c0411b";
     const half = TILE_PX / 2;
-    ctx.fillRect(x + 1, y + 1, half - 2, half - 2);
-    ctx.fillRect(x + half + 1, y + 1, half - 2, half - 2);
-    ctx.fillRect(x + 1, y + half + 1, half - 2, half - 2);
-    ctx.fillRect(x + half + 1, y + half + 1, half - 2, half - 2);
+    const w = TILE_PX / 2;
+    // Top row
+    ctx.fillRect(x + 1, y + 1, w - 2, half - 2);
+    ctx.fillRect(x + half + 1, y + 1, w - 2, half - 2);
+    // Bottom row (staggered by quarter)
+    ctx.fillRect(x + 1, y + half + 1, w / 2 - 2, half - 2);
+    ctx.fillRect(x + w / 2 + 1, y + half + 1, w - 2, half - 2);
+    ctx.fillRect(x + half + w / 2 + 1, y + half + 1, w / 2 - 2, half - 2);
+    // Highlight
+    ctx.fillStyle = "rgba(254,215,170,0.25)";
+    ctx.fillRect(x + 2, y + 2, 4, 1);
+    ctx.fillRect(x + half + 2, y + 2, 4, 1);
   } else if (t === T_STEEL) {
-    ctx.fillStyle = "#9aa0a6";
+    // Brushed-metal cross
+    ctx.fillStyle = "#475569";
     ctx.fillRect(x, y, TILE_PX, TILE_PX);
-    ctx.fillStyle = "#d1d5db";
-    ctx.fillRect(x + 2, y + 2, TILE_PX - 4, TILE_PX - 4);
-    ctx.fillStyle = "#6b7280";
+    ctx.fillStyle = "#94a3b8";
+    ctx.fillRect(x + 3, y + 3, TILE_PX - 6, TILE_PX - 6);
+    ctx.fillStyle = "#cbd5e1";
+    ctx.fillRect(x + 5, y + 5, TILE_PX - 14, 2);
+    ctx.fillRect(x + 5, y + 5, 2, TILE_PX - 14);
+    ctx.fillStyle = "#1e293b";
     ctx.fillRect(x + TILE_PX / 2 - 1, y + 2, 2, TILE_PX - 4);
     ctx.fillRect(x + 2, y + TILE_PX / 2 - 1, TILE_PX - 4, 2);
   } else if (t === T_WATER) {
-    ctx.fillStyle = "#1d4ed8";
+    // Animated ripples
+    ctx.fillStyle = "#1e3a8a";
     ctx.fillRect(x, y, TILE_PX, TILE_PX);
+    const phase = Math.floor(time / 250) % 2;
     ctx.fillStyle = "#3b82f6";
-    ctx.fillRect(x + 2, y + (TILE_PX * 1) / 4, TILE_PX - 4, 2);
-    ctx.fillRect(x + 2, y + (TILE_PX * 3) / 4, TILE_PX - 4, 2);
+    const o = phase === 0 ? 0 : 4;
+    ctx.fillRect(x + 2 + o, y + 6, 6, 2);
+    ctx.fillRect(x + TILE_PX - 12 + o, y + 14, 6, 2);
+    ctx.fillRect(x + 2 + o, y + 22, 6, 2);
+    ctx.fillStyle = "#60a5fa";
+    ctx.fillRect(x + 6, y + 10, 4, 1);
+    ctx.fillRect(x + TILE_PX - 14, y + 18, 4, 1);
   } else if (t === T_BUSH) {
-    ctx.fillStyle = "rgba(16,185,129,0.85)";
+    ctx.fillStyle = "#064e3b";
     ctx.fillRect(x, y, TILE_PX, TILE_PX);
-    ctx.fillStyle = "rgba(6,95,70,0.9)";
-    ctx.fillRect(x + 2, y + 4, 6, 6);
-    ctx.fillRect(x + TILE_PX - 10, y + 6, 6, 6);
-    ctx.fillRect(x + 6, y + TILE_PX - 10, 8, 6);
+    ctx.fillStyle = "#10b981";
+    ctx.fillRect(x + 2, y + 4, 5, 5);
+    ctx.fillRect(x + 10, y + 2, 6, 6);
+    ctx.fillRect(x + TILE_PX - 9, y + 6, 6, 5);
+    ctx.fillRect(x + 4, y + 12, 7, 5);
+    ctx.fillRect(x + 13, y + 14, 6, 6);
+    ctx.fillRect(x + TILE_PX - 11, y + 16, 6, 5);
+    ctx.fillRect(x + 2, y + 20, 6, 5);
+    ctx.fillRect(x + 10, y + 22, 5, 5);
+    ctx.fillStyle = "#34d399";
+    ctx.fillRect(x + 4, y + 6, 2, 2);
+    ctx.fillRect(x + 12, y + 4, 2, 2);
+    ctx.fillRect(x + 15, y + 16, 2, 2);
+    ctx.fillRect(x + 6, y + 22, 2, 2);
   } else if (t === T_EAGLE) {
-    ctx.fillStyle = "#fef3c7";
+    ctx.fillStyle = "#1f2937";
     ctx.fillRect(x, y, TILE_PX, TILE_PX);
-    ctx.fillStyle = "#92400e";
-    // simple eagle silhouette
-    ctx.fillRect(x + TILE_PX / 2 - 2, y + 4, 4, TILE_PX - 8);
-    ctx.fillRect(x + 4, y + TILE_PX / 2 - 2, TILE_PX - 8, 4);
-    ctx.fillRect(x + 6, y + 6, 4, 4);
-    ctx.fillRect(x + TILE_PX - 10, y + 6, 4, 4);
+    ctx.fillStyle = "#fef3c7";
+    // Eagle silhouette — chunky pixel art
+    // Head
+    ctx.fillRect(x + 11, y + 4, 6, 4);
+    // Beak
+    ctx.fillStyle = "#f59e0b";
+    ctx.fillRect(x + 13, y + 8, 2, 3);
+    // Eyes
+    ctx.fillStyle = "#0a0a0a";
+    ctx.fillRect(x + 12, y + 5, 1, 2);
+    ctx.fillRect(x + 15, y + 5, 1, 2);
+    // Body + wings
+    ctx.fillStyle = "#fef3c7";
+    ctx.fillRect(x + 9, y + 11, 10, 6);
+    ctx.fillRect(x + 5, y + 13, 4, 8);
+    ctx.fillRect(x + 19, y + 13, 4, 8);
+    ctx.fillRect(x + 3, y + 16, 3, 6);
+    ctx.fillRect(x + 22, y + 16, 3, 6);
+    // Tail
+    ctx.fillRect(x + 10, y + 17, 8, 6);
+    // Wing details
+    ctx.fillStyle = "#d97706";
+    ctx.fillRect(x + 6, y + 14, 2, 1);
+    ctx.fillRect(x + 20, y + 14, 2, 1);
+    ctx.fillRect(x + 11, y + 18, 6, 1);
   }
 }
 
-function drawTank(ctx: CanvasRenderingContext2D, t: Tank, body: string, dark: string) {
+function drawTank(
+  ctx: CanvasRenderingContext2D,
+  t: Tank,
+  body: string,
+  dark: string,
+  frame: number,
+) {
   const { x, y, dir } = t;
   const s = TANK_SIZE;
-  // Treads
-  ctx.fillStyle = dark;
-  ctx.fillRect(x, y, s, s);
-  ctx.fillStyle = body;
-  // Inset hull
-  ctx.fillRect(x + 4, y + 4, s - 8, s - 8);
-  // Treads stripes
-  ctx.fillStyle = dark;
-  for (let i = 0; i < 4; i++) {
-    ctx.fillRect(x + 1, y + 6 + i * 10, 3, 3);
-    ctx.fillRect(x + s - 4, y + 6 + i * 10, 3, 3);
+
+  // Spawn flash — strobe before becoming solid
+  if (t.spawnFlash > 0) {
+    const on = Math.floor(t.spawnFlash / 80) % 2 === 0;
+    ctx.fillStyle = on ? "rgba(250,204,21,0.55)" : "rgba(96,165,250,0.45)";
+    ctx.fillRect(x + 4, y + 4, s - 8, s - 8);
+    return;
   }
-  // Turret
+
+  const treadFrame = Math.floor(frame / 4) % 2;
+
+  // Tread strips (left + right)
+  ctx.fillStyle = dark;
+  ctx.fillRect(x + 2, y + 4, 8, s - 8);
+  ctx.fillRect(x + s - 10, y + 4, 8, s - 8);
+  // Tread cleats
+  ctx.fillStyle = "rgba(0,0,0,0.45)";
+  for (let i = 0; i < 5; i++) {
+    const cy = y + 6 + i * 9 + treadFrame * 2;
+    ctx.fillRect(x + 3, cy, 6, 2);
+    ctx.fillRect(x + s - 9, cy, 6, 2);
+  }
+
+  // Hull
   ctx.fillStyle = body;
+  ctx.fillRect(x + 10, y + 6, s - 20, s - 12);
+  // Hull shading
+  ctx.fillStyle = "rgba(0,0,0,0.25)";
+  ctx.fillRect(x + 10, y + s - 8, s - 20, 2);
+  ctx.fillStyle = "rgba(255,255,255,0.18)";
+  ctx.fillRect(x + 10, y + 6, s - 20, 2);
+
+  // Turret
   const cx = x + s / 2;
   const cy = y + s / 2;
-  ctx.fillRect(cx - 5, cy - 5, 10, 10);
+  ctx.fillStyle = body;
+  ctx.fillRect(cx - 7, cy - 7, 14, 14);
+  ctx.fillStyle = "rgba(0,0,0,0.3)";
+  ctx.fillRect(cx - 7, cy + 5, 14, 2);
+  ctx.fillStyle = "rgba(255,255,255,0.18)";
+  ctx.fillRect(cx - 7, cy - 7, 14, 2);
+
   // Barrel
   ctx.fillStyle = dark;
   const bw = 4;
-  const bl = s / 2 - 2;
+  const bl = s / 2 + 2;
   if (dir === "up") ctx.fillRect(cx - bw / 2, cy - bl, bw, bl);
   else if (dir === "down") ctx.fillRect(cx - bw / 2, cy, bw, bl);
   else if (dir === "left") ctx.fillRect(cx - bl, cy - bw / 2, bl, bw);
   else ctx.fillRect(cx, cy - bw / 2, bl, bw);
+
+  // Hatch dot on turret (visible direction marker)
+  ctx.fillStyle = "rgba(0,0,0,0.4)";
+  ctx.fillRect(cx - 1, cy - 1, 2, 2);
+}
+
+function drawExplosion(ctx: CanvasRenderingContext2D, e: Explosion) {
+  const maxAge = e.big ? 350 : 200;
+  const tt = e.age / maxAge;
+  const radius = e.big ? 16 : 8;
+  const r = radius * (0.4 + tt * 0.8);
+  // Outer flash
+  ctx.fillStyle = tt < 0.4 ? "#fef3c7" : "rgba(254,243,199,0.6)";
+  ctx.fillRect(e.x - r, e.y - r, r * 2, r * 2);
+  // Inner core
+  ctx.fillStyle = tt < 0.5 ? "#f59e0b" : "#dc2626";
+  const ir = r * 0.6;
+  ctx.fillRect(e.x - ir, e.y - ir, ir * 2, ir * 2);
+  // Sparks
+  if (e.big && tt < 0.6) {
+    ctx.fillStyle = "#fef3c7";
+    for (let i = 0; i < 4; i++) {
+      const angle = (i / 4) * Math.PI * 2 + tt * 3;
+      const dist = r * 1.4;
+      const sx = e.x + Math.cos(angle) * dist;
+      const sy = e.y + Math.sin(angle) * dist;
+      ctx.fillRect(sx - 1, sy - 1, 2, 2);
+    }
+  }
 }
