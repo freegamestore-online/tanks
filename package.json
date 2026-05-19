@@ -1,0 +1,14 @@
+{
+  "name": "tanks",
+  "private": true,
+  "packageManager": "pnpm@10.30.3",
+  "engines": { "node": ">=22" },
+  "pnpm": { "onlyBuiltDependencies": ["esbuild"] },
+  "scripts": {
+    "dev": "pnpm --filter @tanks/web dev",
+    "build": "pnpm --filter @tanks/web build",
+    "preview": "pnpm --filter @tanks/web preview",
+    "typecheck": "pnpm --filter @tanks/web exec tsc -b",
+    "test": "pnpm --filter @tanks/web test"
+  }
+}
