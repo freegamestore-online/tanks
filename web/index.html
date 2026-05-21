@@ -12,6 +12,9 @@
     <meta name="mobile-web-app-capable" content="yes" />
     <link rel="manifest" href="/manifest.json" />
     <title>Tanks — FreeGameStore</title>
+    <!-- Platform analytics loader. CF Web Analytics is auto-provisioned at publish;
+         GA4 / Plausible / custom <head> are opt-in via PUT /v1/apps/tanks/analytics. -->
+    <script src="https://api.freegamestore.online/v1/analytics.js?app=tanks" defer></script>
   </head>
   <body>
     <div id="root"></div>
