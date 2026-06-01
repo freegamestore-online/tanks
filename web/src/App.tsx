@@ -139,7 +139,7 @@ const LEVEL_2: string[] = [
   "B.B.B.B.B.B.B",
   ".............",
   ".B...X.X...B.",
-  ".S.S.S.S.S.S.",
+  ".S...S.S...S.",
   ".............",
   "B.B.B.B.B.B.B",
   ".............",
@@ -920,24 +920,38 @@ export default function App() {
 
   const PadBtn = ({ label, k }: { label: string; k: "up" | "down" | "left" | "right" }) => (
     <button
-      onPointerDown={(e) => { e.preventDefault(); setInput(k, true); }}
+      // Capture the pointer on press so the input stays bound to this button
+      // even if the finger drifts to an edge/corner or slightly off — otherwise
+      // a tiny jitter fires pointerleave and the tank stops mid-move.
+      onPointerDown={(e) => {
+        e.preventDefault();
+        e.currentTarget.setPointerCapture(e.pointerId);
+        setInput(k, true);
+      }}
       onPointerUp={() => setInput(k, false)}
-      onPointerLeave={() => setInput(k, false)}
       onPointerCancel={() => setInput(k, false)}
+      onLostPointerCapture={() => setInput(k, false)}
       aria-label={k}
       style={{
-        width: "3rem",
-        height: "3rem",
+        width: "3.75rem",
+        height: "3.75rem",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        padding: 0,
         background: "var(--panel)",
         border: "1px solid var(--line-strong)",
         borderRadius: "0.5rem",
         color: "var(--ink)",
         fontFamily: "Fraunces, serif",
         fontWeight: 700,
-        fontSize: "1.25rem",
-        touchAction: "manipulation",
+        fontSize: "1.4rem",
+        // "none" (not "manipulation") so the browser never reinterprets the
+        // touch as a scroll/pan and cancels the press.
+        touchAction: "none",
         userSelect: "none",
         WebkitUserSelect: "none",
+        WebkitTapHighlightColor: "transparent",
       }}
     >
       {label}
@@ -1169,7 +1183,7 @@ export default function App() {
             paddingBottom: "0.25rem",
           }}
         >
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(3, auto)", gap: "0.25rem" }}>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(3, auto)", gap: "0.35rem" }}>
             <span />
             <PadBtn label="▲" k="up" />
             <span />
@@ -1182,24 +1196,33 @@ export default function App() {
           </div>
 
           <button
-            onPointerDown={(e) => { e.preventDefault(); inputRef.current.fire = true; }}
+            onPointerDown={(e) => {
+              e.preventDefault();
+              e.currentTarget.setPointerCapture(e.pointerId);
+              inputRef.current.fire = true;
+            }}
             onPointerUp={() => (inputRef.current.fire = false)}
-            onPointerLeave={() => (inputRef.current.fire = false)}
             onPointerCancel={() => (inputRef.current.fire = false)}
+            onLostPointerCapture={() => (inputRef.current.fire = false)}
             aria-label="Fire"
             style={{
-              width: "4.5rem",
-              height: "4.5rem",
+              width: "5.5rem",
+              height: "5.5rem",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              padding: 0,
               background: "var(--accent)",
               color: "var(--paper)",
               border: "none",
               borderRadius: "50%",
               fontFamily: "Fraunces, serif",
               fontWeight: 800,
-              fontSize: "1.1rem",
-              touchAction: "manipulation",
+              fontSize: "1.25rem",
+              touchAction: "none",
               userSelect: "none",
               WebkitUserSelect: "none",
+              WebkitTapHighlightColor: "transparent",
               boxShadow: "0 4px 0 rgba(0,0,0,0.25)",
             }}
           >
