@@ -7,6 +7,7 @@ import {
   useGameSounds,
 } from "@freegamestore/games";
 import { useHighScore } from "./hooks/useHighScore";
+import { bindKeyboard, type Input } from "./input";
 
 // useGameSounds reads SoundContext which GameShell provides INTERNALLY.
 // Calling it directly above <GameShell> would get a disconnected (muted)
@@ -452,11 +453,10 @@ function damageBullet(s: GameState, b: Bullet): "brick" | "steel" | "base" | nul
 export default function App() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const stateRef = useRef<GameState>(freshStateForStage(1, START_LIVES, 0));
-  const inputRef = useRef<{ up: boolean; down: boolean; left: boolean; right: boolean; fire: boolean }>(
-    { up: false, down: false, left: false, right: false, fire: false },
-  );
+  const inputRef = useRef<Input>({ up: false, down: false, left: false, right: false, fire: false });
   const lastTimeRef = useRef(0);
   const killsRef = useRef(0);
+  const queueLeftRef = useRef(-1);
   const livesRef = useRef(START_LIVES);
   const scoreRef = useRef(0);
   const stageRef = useRef(1);
@@ -468,6 +468,8 @@ export default function App() {
   const [score, setScore] = useState(0);
   const [lives, setLives] = useState(START_LIVES);
   const [kills, setKills] = useState(0);
+  // Only re-renders the queue strip, which reads stateRef.current.spawnQueue.
+  const [, setQueueLeft] = useState(0);
   const [phase, setPhase] = useState<Phase>("intro");
   const [paused, setPaused] = useState(false);
   const [stageClearSummary, setStageClearSummary] = useState<StageSummary | null>(null);
@@ -519,34 +521,10 @@ export default function App() {
   }, [updateHighScore, updateBestStage]);
 
   // Keyboard
-  useEffect(() => {
-    const down = (e: KeyboardEvent) => {
-      switch (e.key) {
-        case "ArrowUp": case "w": case "W": inputRef.current.up = true; e.preventDefault(); break;
-        case "ArrowDown": case "s": case "S": inputRef.current.down = true; e.preventDefault(); break;
-        case "ArrowLeft": case "a": case "A": inputRef.current.left = true; e.preventDefault(); break;
-        case "ArrowRight": case "d": case "D": inputRef.current.right = true; e.preventDefault(); break;
-        case " ": case "Enter": case "k": case "K": case "x": case "X":
-          inputRef.current.fire = true; e.preventDefault(); break;
-      }
-    };
-    const up = (e: KeyboardEvent) => {
-      switch (e.key) {
-        case "ArrowUp": case "w": case "W": inputRef.current.up = false; break;
-        case "ArrowDown": case "s": case "S": inputRef.current.down = false; break;
-        case "ArrowLeft": case "a": case "A": inputRef.current.left = false; break;
-        case "ArrowRight": case "d": case "D": inputRef.current.right = false; break;
-        case " ": case "Enter": case "k": case "K": case "x": case "X":
-          inputRef.current.fire = false; break;
-      }
-    };
-    window.addEventListener("keydown", down);
-    window.addEventListener("keyup", up);
-    return () => {
-      window.removeEventListener("keydown", down);
-      window.removeEventListener("keyup", up);
-    };
-  }, []);
+  useEffect(
+    () => bindKeyboard(inputRef.current, () => phaseRef.current === "playing" && !pausedRef.current),
+    [],
+  );
 
   // Canvas sizing
   useEffect(() => {
@@ -826,6 +804,10 @@ export default function App() {
       if (s.killsThisStage !== killsRef.current) {
         killsRef.current = s.killsThisStage;
         setKills(s.killsThisStage);
+      }
+      if (s.spawnQueue.length !== queueLeftRef.current) {
+        queueLeftRef.current = s.spawnQueue.length;
+        setQueueLeft(s.spawnQueue.length);
       }
       if (s.lives !== livesRef.current) {
         livesRef.current = s.lives;
