@@ -8,6 +8,18 @@ import {
 } from "@freegamestore/games";
 import { useHighScore } from "./hooks/useHighScore";
 
+// useGameSounds reads SoundContext which GameShell provides INTERNALLY.
+// Calling it directly above <GameShell> would get a disconnected (muted)
+// default; AudioBridge is a tiny no-render child of GameShell that exposes
+// the real sounds API via ref to the App scope.
+type SoundsApi = ReturnType<typeof useGameSounds>;
+
+function AudioBridge({ apiRef }: { apiRef: React.MutableRefObject<SoundsApi | null> }) {
+  const sounds = useGameSounds();
+  apiRef.current = sounds;
+  return null;
+}
+
 // Battle-City-style 13×13 field. NES feel.
 
 const COLS = 13;
@@ -449,19 +461,22 @@ export default function App() {
   const scoreRef = useRef(0);
   const stageRef = useRef(1);
   const phaseRef = useRef<Phase>("intro");
+  const pausedRef = useRef(false);
+  const soundsRef = useRef<SoundsApi | null>(null);
 
   const [stage, setStage] = useState(1);
   const [score, setScore] = useState(0);
   const [lives, setLives] = useState(START_LIVES);
   const [kills, setKills] = useState(0);
   const [phase, setPhase] = useState<Phase>("intro");
+  const [paused, setPaused] = useState(false);
   const [stageClearSummary, setStageClearSummary] = useState<StageSummary | null>(null);
   const [, force] = useState(0);
   const [bestScore, updateHighScore] = useHighScore("tanks-best");
   const [bestStage, updateBestStage] = useHighScore("tanks-best-stage");
-  const sounds = useGameSounds();
 
   phaseRef.current = phase;
+  pausedRef.current = paused;
 
   const startNewGame = useCallback(() => {
     stateRef.current = freshStateForStage(1, START_LIVES, 0);
@@ -475,6 +490,7 @@ export default function App() {
     setLives(START_LIVES);
     setKills(0);
     setStageClearSummary(null);
+    setPaused(false);
     setPhase("stage-intro");
     force((x) => x + 1);
   }, []);
@@ -489,7 +505,7 @@ export default function App() {
       updateHighScore(cur.totalScore);
       updateBestStage(cur.stage);
       setPhase("won");
-      sounds.playLevelUp();
+      soundsRef.current?.playLevelUp();
       return;
     }
     stateRef.current = freshStateForStage(nextStage, cur.lives, cur.totalScore);
@@ -500,7 +516,7 @@ export default function App() {
     setKills(0);
     setStageClearSummary(null);
     setPhase("stage-intro");
-  }, [sounds, updateHighScore, updateBestStage]);
+  }, [updateHighScore, updateBestStage]);
 
   // Keyboard
   useEffect(() => {
@@ -577,7 +593,7 @@ export default function App() {
       const s = stateRef.current;
       s.frame++;
       s.time += dt;
-      if (phaseRef.current === "playing") step(s, dt);
+      if (phaseRef.current === "playing" && !pausedRef.current) step(s, dt);
       draw(s);
       raf = requestAnimationFrame(tick);
     };
@@ -611,7 +627,7 @@ export default function App() {
           tryMove(s.field, s.player, v.dx * PLAYER_SPEED * dt, v.dy * PLAYER_SPEED * dt, s.enemies);
         }
         if (inp.fire && s.player.cooldown === 0) {
-          if (fire(s.player, s)) sounds.playMove();
+          if (fire(s.player, s)) soundsRef.current?.playMove();
         }
       }
 
@@ -685,13 +701,13 @@ export default function App() {
           const wall = damageBullet(s, b);
           if (wall) {
             if (wall === "brick") {
-              sounds.playMove();
+              soundsRef.current?.playMove();
               s.explosions.push({ x: cx, y: cy, age: 0, big: false });
             } else if (wall === "steel") {
-              sounds.playTick();
+              soundsRef.current?.playTick();
               s.explosions.push({ x: cx, y: cy, age: 0, big: false });
             } else if (wall === "base") {
-              sounds.playGameOver();
+              soundsRef.current?.playGameOver();
               s.explosions.push({ x: cx, y: cy, age: 0, big: true });
             }
             hit = "wall";
@@ -727,7 +743,7 @@ export default function App() {
                   s.totalScore += pts;
                   s.explosions.push({ x: e.x + TANK_SIZE / 2, y: e.y + TANK_SIZE / 2, age: 0, big: true });
                   s.popups.push({ x: e.x + TANK_SIZE / 2, y: e.y + TANK_SIZE / 2, points: pts, age: 0 });
-                  sounds.playError();
+                  soundsRef.current?.playError();
                 } else {
                   s.explosions.push({ x: e.x + TANK_SIZE / 2, y: e.y + TANK_SIZE / 2, age: 0, big: false });
                 }
@@ -739,7 +755,7 @@ export default function App() {
             s.player.alive = false;
             s.explosions.push({ x: s.player.x + TANK_SIZE / 2, y: s.player.y + TANK_SIZE / 2, age: 0, big: true });
             hit = "tank";
-            sounds.playError();
+            soundsRef.current?.playError();
           }
         }
         if (!hit) liveBullets.push(b);
@@ -834,17 +850,17 @@ export default function App() {
         setStageClearSummary(summary);
         setPhase("stage-clear");
         phaseRef.current = "stage-clear";
-        sounds.playLevelUp();
+        soundsRef.current?.playLevelUp();
       }
       if (s.gameOver && phaseRef.current === "playing") {
         updateHighScore(s.totalScore);
         updateBestStage(s.stage);
         setPhase("over");
         phaseRef.current = "over";
-        sounds.playGameOver();
+        soundsRef.current?.playGameOver();
       }
     },
-    [sounds, updateHighScore, updateBestStage],
+    [updateHighScore, updateBestStage],
   );
 
   const draw = useCallback((s: GameState) => {
@@ -997,10 +1013,13 @@ export default function App() {
               </ul>
             </div>
           }
+          onPlayPause={phase === "playing" ? () => setPaused((p) => !p) : undefined}
+          paused={paused}
           actions={<GameAuth />}
         />
       }
     >
+      <AudioBridge apiRef={soundsRef} />
       <div
         style={{
           height: "100%",
@@ -1109,6 +1128,14 @@ export default function App() {
                 Arrows / WASD to move · Space / X to fire
               </div>
               <GameButton size="md" variant="primary" onClick={startNewGame}>Start</GameButton>
+            </Overlay>
+          )}
+          {phase === "playing" && paused && (
+            <Overlay>
+              <div style={{ fontFamily: "Fraunces, serif", fontWeight: 800, fontSize: "1.5rem", color: "#facc15" }}>
+                PAUSED
+              </div>
+              <GameButton size="md" variant="primary" onClick={() => setPaused(false)}>Resume</GameButton>
             </Overlay>
           )}
           {phase === "stage-intro" && (
